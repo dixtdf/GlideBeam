@@ -1,0 +1,47 @@
+GlideBeam / 光梭
+
+First-party source code and assets are distributed under the MIT License.
+See LICENSE for the project license.
+
+Third-party components retain their own licenses. Cargo.lock identifies the
+exact Rust dependency versions; crate source packages include their upstream
+license files. Release packages preserve complete applicable upstream texts
+in THIRD-PARTY-LICENSES.txt, generated from the locked package sources and
+Windows runtime license files. Exact-source fallback texts for crates whose
+published archive omits licenses are in third_party/licenses. The transport
+uses Quinn, rustls/ring, Tokio, rcgen, RustCrypto
+SPAKE2/HMAC/SHA-2, and additional dependencies. Relevant upstream projects:
+
+  https://github.com/quinn-rs/quinn
+  https://github.com/rustls/rustls
+  https://github.com/briansmith/ring
+  https://github.com/tokio-rs/tokio
+  https://github.com/rustls/rcgen
+  https://github.com/RustCrypto/PAKEs
+  https://github.com/RustCrypto/MACs
+  https://github.com/RustCrypto/hashes
+
+Windows builds use MinGW-w64 or LLVM-MinGW. Applicable runtime components,
+including winpthreads for x64 and LLVM libunwind for ARM64 when bundled,
+remain covered by their upstream license and copyright notices. LLVM and
+libunwind use Apache-2.0 WITH LLVM-exception; LLVM-MinGW's MinGW-w64
+components have their own upstream licenses. Statically linked GCC libgcc
+and libstdc++ use the applicable GPLv3 terms with the GCC Runtime Library
+Exception; the generated notices preserve these texts as well. Rust's
+standard-library copyrights and license texts are collected from the pinned
+Rust toolchain, in addition to the Cargo dependencies. See:
+
+  https://www.mingw-w64.org/
+  https://github.com/mstorsjo/llvm-mingw
+  https://llvm.org/docs/DeveloperPolicy.html#copyright-license-and-patents
+
+macOS and Windows platform APIs are provided by their respective operating
+systems and are not redistributed as source by this project.
+
+No NVIDIA driver, macOS installer/image, development signing keychain,
+private signing key, pairing token, or saved connection configuration is
+included in the public source or release packaging. The experimental NVIDIA
+setup described in the README is a reference environment only; the driver
+is a separate upstream project:
+
+  https://github.com/nullmoth/nvidia-macos-driver

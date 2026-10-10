@@ -1,0 +1,5 @@
+"CFBundleName" = "光梭";
+"CFBundleDisplayName" = "光梭 · Mac 端";
+"NSScreenCaptureUsageDescription" = "将这台 Mac 的桌面共享给已配对的 Windows 电脑。";
+"NSLocalNetworkUsageDescription" = "通过局域网接收已配对 Windows 电脑的远程桌面连接。";
+"NSAppleEventsUsageDescription" = "使用你授权的辅助功能接收远程键盘与鼠标操作。";

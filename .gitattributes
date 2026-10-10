@@ -1,0 +1,8 @@
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.icns binary
+*.jpg binary
+*.zip binary
+third_party/licenses/** -whitespace
+apps/windows-client/native-manifest.specs whitespace=-blank-at-eof

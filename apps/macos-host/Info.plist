@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>RemoteHost</string>
+  <key>CFBundleIdentifier</key><string>dev.remote-native.host</string>
+  <key>CFBundleName</key><string>GlideBeam</string>
+  <key>CFBundleDisplayName</key><string>GlideBeam · Mac host</string>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>CFBundleLocalizations</key><array><string>en</string><string>zh-Hans</string></array>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleIconFile</key><string>RemoteNative.icns</string>
+  <key>CFBundleShortVersionString</key><string>0.2.0</string>
+  <key>CFBundleVersion</key><string>7</string>
+  <key>LSMinimumSystemVersion</key><string>15.2</string>
+  <key>LSUIElement</key><true/>
+  <key>NSScreenCaptureUsageDescription</key><string>Share this Mac desktop with a paired Windows computer.</string>
+  <key>NSLocalNetworkUsageDescription</key><string>Accept remote desktop connections from paired Windows computers on your local network.</string>
+  <key>NSAppleEventsUsageDescription</key><string>Use your authorized Accessibility access to receive remote keyboard and mouse input.</string>
+  <key>NSHighResolutionCapable</key><true/>
+</dict></plist>

@@ -1,0 +1,28 @@
+# Compatibility
+
+GlideBeam is developed for a logged-in Mac desktop on a LAN, controlled from Windows 11. Compatibility across other hardware, drivers, VMs, and OS versions is not guaranteed.
+
+| Target | Build / packaging | Physical-device validation |
+| --- | --- | --- |
+| Windows x64 | Native GNU/UCRT build | Windows 11 Pro build 26300, Core i3-10100F, 16 GB, Radeon RX Vega driver 31.0.12027.9001 |
+| Windows ARM64 | Native ARM64 PE cross-build using LLVM-MinGW and Rust gnullvm | Not performed |
+| Mac Intel x64 | Native x86_64 Mach-O | macOS 15.8.1 build 24H32, Unraid VM, RTX 3060 12 GB passthrough |
+| Mac Apple Silicon | Native ARM64 Mach-O build target | Not performed |
+
+The deployment minimum is macOS 15.2. Actual Intel Mac validation used 15.8.1. Windows validation used a 2560 × 1440 local display and a 1920 × 1080 remote stream. The Mac VM has 20 logical CPUs and 16 GiB RAM; it reports Genuine Intel CPU 0000 at 3.30 GHz. The physical host was reported as a Core i9-10900K ES QTB2 / ASRock B460M Pro4S/ac with Above 4G Decoding enabled.
+
+## Capture and codecs
+
+A usable Mac display source, Screen Recording permission, and Accessibility permission are required. The current implementation requires H.264 hardware encoding through VideoToolbox and Windows hardware decoding through Media Foundation / D3D11. Driver and OS capability determine whether startup succeeds. H.264 is the supported protocol codec for this release; HEVC and a software fallback are not promised.
+
+The tested RTX 3060 environment uses the experimental [nullmoth/nvidia-macos-driver](https://github.com/nullmoth/nvidia-macos-driver). GlideBeam does not include or install that driver and does not require it as a general macOS dependency. The reference VM results do not establish support for other NVIDIA cards, macOS releases, or driver revisions.
+
+A narrow NV12 layout workaround is gated by the SHA-256 of a recognized loaded NVENC module. It compensates for that module's particular buffer layout and a padded 1088-line encoding surface, while presenting the intended 1080-line desktop. It does not modify a driver. An unknown module revision is not automatically treated as equivalent and needs separate validation. See the implementation in `apps/macos-host/nv12-layout.hpp`.
+
+## Current boundaries
+
+Single display, an already logged-in user desktop, LAN access, text/PNG clipboard, and on-demand two-way file transfer are the current scope. Audio, rich text, directory mirroring, deletion through cross-machine cut, login-before-user control, and public relay/NAT traversal are not implemented. Closing the host window leaves the menu-bar agent running. Start at login starts after that user logs in.
+
+Disconnecting does not actively lock the Mac. Screen saver, power, and password policies are controlled by macOS. A target frame rate of 60 FPS does not guarantee delivered FPS or total input-to-display latency. Static screens can produce very few new capture frames without indicating a transport fault.
+
+Hosted CI checks builds, offline tests, architecture, imports, signatures, and packaging. It cannot establish capture permission, hardware codec behavior, Finder/Explorer drag-and-drop behavior, or remote pointer feel for a particular physical machine.

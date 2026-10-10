@@ -1,0 +1,242 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: '1.99.0'
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - id: version
+        run: python scripts/ci-version.py
+      - name: Check public source and localization
+        run: |
+          python scripts/check-public-source.py
+          python scripts/validate-i18n.py
+
+  windows:
+    needs: metadata
+    runs-on: windows-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x64
+            rust-target: x86_64-pc-windows-gnu
+          - architecture: arm64
+            rust-target: aarch64-pc-windows-gnullvm
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - name: Set up x64 UCRT toolchain
+        if: matrix.architecture == 'x64'
+        id: msys
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-gcc
+      - name: Set x64 compiler paths
+        if: matrix.architecture == 'x64'
+        env:
+          MSYS2_ROOT: ${{ steps.msys.outputs.msys2-location }}
+        run: |
+          $taskCompilerBin = Join-Path $env:MSYS2_ROOT 'ucrt64\bin'
+          $taskCompilerBin | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+          "GLIDEBEAM_TOOLCHAIN_BIN=$taskCompilerBin" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          'CC_x86_64_pc_windows_gnu=gcc' | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          'CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=gcc' | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Set up ARM64 cross compiler
+        if: matrix.architecture == 'arm64'
+        run: |
+          ./scripts/setup-llvm-mingw.ps1 -Destination (Join-Path $env:RUNNER_TEMP 'llvm-mingw')
+          'CC_aarch64_pc_windows_gnullvm=aarch64-w64-mingw32-clang' | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          'CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER=aarch64-w64-mingw32-clang' | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Install pinned Rust toolchain
+        env:
+          RUST_TARGET: ${{ matrix.rust-target }}
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain installation failed' }
+          rustup target add --toolchain $env:RUST_TOOLCHAIN $env:RUST_TARGET
+          if ($LASTEXITCODE -ne 0) { throw 'Rust target installation failed' }
+      - name: Rust unit tests (x64)
+        if: matrix.architecture == 'x64'
+        run: |
+          cargo test --locked -p remote_transport --target x86_64-pc-windows-gnu
+          if ($LASTEXITCODE -ne 0) { throw 'Rust tests failed' }
+      - name: Build native client and transport
+        env:
+          BUILD_ARCHITECTURE: ${{ matrix.architecture }}
+          RUST_TARGET: ${{ matrix.rust-target }}
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: ./scripts/build-windows.ps1 -OutputDirectory "dist/windows-$env:BUILD_ARCHITECTURE" -Architecture $env:BUILD_ARCHITECTURE -ToolchainDirectory $env:GLIDEBEAM_TOOLCHAIN_BIN -CargoExe (Get-Command cargo.exe).Source -RustTarget $env:RUST_TARGET -Version $env:RELEASE_VERSION
+      - name: Native regression tests (x64)
+        if: matrix.architecture == 'x64'
+        run: ./scripts/test-windows-ci.ps1 -RuntimeDirectory dist/windows-x64 -ToolchainDirectory $env:GLIDEBEAM_TOOLCHAIN_BIN
+      - name: Verify PE architecture, dependencies and manifest
+        env:
+          BUILD_ARCHITECTURE: ${{ matrix.architecture }}
+        run: python scripts/check_windows_binary.py --runtime "dist/windows-$env:BUILD_ARCHITECTURE" --architecture $env:BUILD_ARCHITECTURE
+      - name: Package public files
+        env:
+          BUILD_ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          python scripts/third-party-notices.py --output build/third-party/THIRD-PARTY-LICENSES.txt --toolchain-root (Split-Path -Parent $env:GLIDEBEAM_TOOLCHAIN_BIN)
+          if ($LASTEXITCODE -ne 0) { throw 'Third party license collection failed' }
+          python scripts/package-ci.py --platform Windows --architecture $env:BUILD_ARCHITECTURE --runtime "dist/windows-$env:BUILD_ARCHITECTURE" --output artifacts
+      - name: Upload package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: GlideBeam-Windows-${{ matrix.architecture }}
+          path: artifacts/*
+          if-no-files-found: error
+          compression-level: 0
+      - name: Upload test diagnostics
+        if: always() && matrix.architecture == 'x64'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-results-Windows-x64
+          path: build/ci-tests/windows/*.json
+          if-no-files-found: ignore
+
+  macos:
+    needs: metadata
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            architecture: x64
+            clang-architecture: x86_64
+            rust-target: x86_64-apple-darwin
+          - runner: macos-15
+            architecture: arm64
+            clang-architecture: arm64
+            rust-target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - name: Install pinned Rust toolchain
+        env:
+          RUST_TARGET: ${{ matrix.rust-target }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup target add --toolchain "$RUST_TOOLCHAIN" "$RUST_TARGET"
+      - name: Rust unit tests
+        env:
+          RUST_TARGET: ${{ matrix.rust-target }}
+        run: cargo test --locked -p remote_transport --target "$RUST_TARGET"
+      - name: Build host and transport
+        env:
+          RUST_TARGET: ${{ matrix.rust-target }}
+          CLANG_ARCHITECTURE: ${{ matrix.clang-architecture }}
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+          REMOTE_USE_LOCAL_SIGNING: '0'
+        run: |
+          cargo build --locked --release -p remote_transport --target "$RUST_TARGET"
+          bash apps/macos-host/build-macos.sh "target/$RUST_TARGET/release/libremote_transport.a" 'dist/GlideBeam Host.app' "$RELEASE_VERSION" "$CLANG_ARCHITECTURE"
+          lipo 'dist/GlideBeam Host.app/Contents/MacOS/RemoteHost' -verify_arch "$CLANG_ARCHITECTURE"
+          codesign --verify --strict 'dist/GlideBeam Host.app'
+          'dist/GlideBeam Host.app/Contents/MacOS/RemoteHost' --self-test-localization
+      - name: Offline native regression tests
+        run: bash scripts/test-macos-ci.sh
+      - name: Package public files
+        env:
+          BUILD_ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          python scripts/third-party-notices.py --output build/third-party/THIRD-PARTY-LICENSES.txt
+          python scripts/package-ci.py --platform macOS --architecture "$BUILD_ARCHITECTURE" --runtime 'dist/GlideBeam Host.app' --output artifacts
+      - name: Upload package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: GlideBeam-macOS-${{ matrix.architecture }}
+          path: artifacts/*
+          if-no-files-found: error
+          compression-level: 0
+      - name: Upload test diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-results-macOS-${{ matrix.architecture }}
+          path: build/ci-tests/macos/*.txt
+          if-no-files-found: ignore
+
+  draft-release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [metadata, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: GlideBeam-*
+          merge-multiple: true
+          path: artifacts
+      - name: Verify and combine checksums
+        run: |
+          cd artifacts
+          sha256sum --check --strict *.zip.sha256
+          cat *.zip.sha256 | LC_ALL=C sort > SHA256SUMS.txt
+          test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 4
+      - name: Prepare draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+          IS_PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+        run: |
+          args=(--draft --title "GlideBeam $RELEASE_VERSION / 光梭" --generate-notes)
+          if [ "$IS_PRERELEASE" = true ]; then args+=(--prerelease); fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            if [ "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" != true ]; then
+              echo 'Refusing to overwrite an already published release.' >&2
+              exit 1
+            fi
+            gh release upload "$RELEASE_TAG" artifacts/*.zip artifacts/SHA256SUMS.txt --clobber
+          else
+            gh release create "$RELEASE_TAG" artifacts/*.zip artifacts/SHA256SUMS.txt "${args[@]}"
+          fi
