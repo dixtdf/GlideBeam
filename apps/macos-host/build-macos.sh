@@ -21,6 +21,31 @@ xcrun clang++ -std=c++20 -fobjc-arc -O2 -g -Wall -Wextra -Wno-unused-parameter \
   -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework Security \
   -framework Carbon -framework SystemConfiguration -framework Network -framework Foundation -framework ImageIO \
   -o "$app_dir/Contents/MacOS/RemoteHost"
+# Apple clang may run dsymutil for this single-step -g build. Keep symbols
+# beside the app before signing so the public app contains runtime files only.
+/usr/bin/python3 - "$app_dir" <<'PY'
+from pathlib import Path
+import shutil
+import sys
+
+requested = Path(sys.argv[1])
+if requested.is_symlink():
+    raise SystemExit("App output must not be a symlink")
+app = requested.resolve(strict=True)
+generated = app / "Contents/MacOS/RemoteHost.dSYM"
+external = app.with_name(app.name + ".dSYM")
+if generated.exists() or generated.is_symlink():
+    for directory in (generated, external):
+        if directory.is_symlink():
+            raise SystemExit("Debug-symbol output must not be a symlink")
+        if directory.exists():
+            dwarf = directory / "Contents/Resources/DWARF/RemoteHost"
+            if not directory.is_dir() or not dwarf.is_file() or dwarf.is_symlink():
+                raise SystemExit("Refusing to replace an unexpected debug-symbol output")
+    if external.exists():
+        shutil.rmtree(external)
+    generated.rename(external)
+PY
 cp apps/macos-host/Info.plist "$app_dir/Contents/Info.plist"
 cp assets/app-icon.icns "$app_dir/Contents/Resources/RemoteNative.icns"
 if [ -d apps/macos-host/resources ]; then

@@ -192,7 +192,8 @@ def collect(output: Path, cargo: str, toolchain: Path | None, offline: bool, rus
                 runtime_count += 1
     data = "".join(sections)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(data, encoding="utf-8", newline="\n")
+    with output.open("w", encoding="utf-8", newline="\n") as destination:
+        destination.write(data)
     return {"rust_packages": len(packages), "rust_license_texts": license_count,
             "rust_runtime_license_texts": len(rust_runtime),
             "runtime_license_texts": runtime_count, "bytes": len(data.encode("utf-8"))}
