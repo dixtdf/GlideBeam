@@ -96,8 +96,10 @@ pub fn transport() -> Arc<quinn::TransportConfig> {
     config.keep_alive_interval(Some(std::time::Duration::from_secs(2)));
     config.max_idle_timeout(Some(std::time::Duration::from_secs(10).try_into().unwrap()));
     config.datagram_receive_buffer_size(Some(16 * 1024 * 1024));
-    // send_datagram_wait below applies backpressure instead of silently evicting a reference frame.
-    config.datagram_send_buffer_size(2 * 1024 * 1024);
+    // Keep Quinn's hidden datagram backlog below ~20 ms of stereo PCM. All media
+    // uses send_datagram_wait so sound never silently evicts video reference packets.
+    // Video send deadlines still trigger explicit IDR recovery under congestion.
+    config.datagram_send_buffer_size(4 * 1024);
     Arc::new(config)
 }
 #[derive(Debug)]

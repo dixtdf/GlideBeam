@@ -64,7 +64,7 @@ constexpr wchar_t kWindowClass[] = L"RemoteNativeWindow";
 constexpr wchar_t kCanvasClass[] = L"RemoteNativeCanvas";
 constexpr wchar_t kOverlayClass[] = L"RemoteNativeSessionOverlay";
 constexpr float kToolbarWidth = 762.f, kToolbarHeight = 64.f;
-constexpr float kMetricsWidth = 400.f, kMetricsHeight = 326.f;
+constexpr float kMetricsWidth = 400.f, kMetricsHeight = 456.f;
 constexpr float kCaptureNoticeWidth = 480.f, kCaptureNoticeHeight = 172.f;
 constexpr float kNavWidth = 206.f;
 const wchar_t* MacEncoderText(const SessionSnapshot& snapshot) {
@@ -457,9 +457,18 @@ struct Ui {
         row(L"Windows 视频解码", decoding ? L"GPU 硬件解码" : L"等待硬件解码", 183, decoding ? ACCENT : MUTED);
         std::swprintf(value, 64, L"%u \u00d7 %u", snapshot.videoWidth, snapshot.videoHeight); row(L"远端分辨率", value, 209);
         std::swprintf(value, 64, remote_i18n::Text(L"%u 帧"), snapshot.queuedFrames); row(L"等待处理", value, 235);
-        out.Line(18, 271, kMetricsWidth - 18, 271, LINE);
-        out.Text(preview ? L"合成数据 · 仅用于界面预览" : L"处理时间为 CPU 计时，含解码、转换与提交。", 18, 277, kMetricsWidth - 36, 22, 9, MUTED);
-        out.Text(L"该数值不代表完整交互延迟。", 18, 299, kMetricsWidth - 36, 19, 9, MUTED);
+        const wchar_t* audioText=L"等待系统声音";
+        if(snapshot.macAudioState=="unavailable"||snapshot.audio.state==AudioPlaybackState::Unavailable)audioText=L"音频不可用";
+        else if(snapshot.audio.muted)audioText=L"已静音";
+        else if(snapshot.audio.state==AudioPlaybackState::Playing)audioText=L"PCM · 48 kHz · 双声道";
+        row(L"系统声音",audioText,261,snapshot.audio.state==AudioPlaybackState::Playing?ACCENT:MUTED);
+        std::swprintf(value,64,L"%.1f / %.0f ms",snapshot.audio.queueMs,snapshot.audio.targetMs);row(L"音频缓冲 / 目标",value,287);
+        std::swprintf(value,64,L"%.1f / %.1f ms",snapshot.audio.deviceQueuedMs,snapshot.audio.devicePeriodMs);row(L"声卡排队 / 周期",value,313);
+        std::swprintf(value,64,L"%llu / %llu",static_cast<unsigned long long>(snapshot.audio.underruns),static_cast<unsigned long long>(snapshot.audio.lost));row(L"音频欠载 / 丢包",value,339);
+        std::swprintf(value,64,L"%llu",static_cast<unsigned long long>(snapshot.audio.deviceUnderruns));row(L"声卡耗尽事件",value,365);
+        out.Line(18, 401, kMetricsWidth - 18, 401, LINE);
+        out.Text(preview ? L"合成数据 · 仅用于界面预览" : L"处理时间为 CPU 计时，含解码、转换与提交。", 18, 407, kMetricsWidth - 36, 22, 9, MUTED);
+        out.Text(L"该数值不代表完整交互延迟。", 18, 429, kMetricsWidth - 36, 19, 9, MUTED);
     }
     void DrawSyntheticDesktop() {
         // Entirely synthetic artwork; no screen capture, host connection or credentials.
@@ -889,6 +898,7 @@ struct Ui {
         if (!menu) return;
         AppendMenuW(menu, MF_STRING | (connected && snapshot.state == SessionState::Connected && snapshot.restartSupported && !snapshot.restartBusy ? 0 : MF_GRAYED), 1, remote_i18n::Text(L"重启 Mac…"));
         if (!snapshot.restartState.empty()) AppendMenuW(menu, MF_STRING, 2, remote_i18n::Text(L"查看重启状态"));
+        AppendMenuW(menu, MF_STRING | (connected ? 0 : MF_GRAYED), 4, remote_i18n::Text(snapshot.audio.muted ? L"恢复系统声音" : L"静音系统声音"));
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         LanguageMenu(menu);
         AppendMenuW(menu, MF_STRING, 3, remote_i18n::Text(L"打开 Windows 日志目录"));
@@ -909,6 +919,9 @@ struct Ui {
         } else if (choice == 2) {
             restartNoticeUntil = GetTickCount64() + 25000;
             PositionOverlays();
+        } else if (choice == 4) {
+            session->SetAudioMuted(!snapshot.audio.muted); snapshot=session->Snapshot();
+            if(metrics.window)InvalidateRect(metrics.window,nullptr,FALSE);
         } else if (choice == 3) {
             const auto directory = remote_log::Directory();
             std::error_code error; std::filesystem::create_directories(directory, error);
@@ -1277,6 +1290,11 @@ bool RenderUiPreview(const wchar_t* path, UiPreview mode) {
     ui.snapshot.bitrateMbps = 8.62; ui.snapshot.networkMs = 1.24; ui.snapshot.decodeMs = 1.70;
     ui.snapshot.hardwareDecode = true; ui.snapshot.actualFrames = 1234;
     ui.snapshot.macEncoderMode = MacVideoEncoderMode::AppleSoftware;
+    ui.snapshot.audio.state = AudioPlaybackState::Playing;
+    ui.snapshot.audio.queueMs = 14.8;
+    ui.snapshot.audio.targetMs = 15.0;
+    ui.snapshot.audio.deviceQueuedMs = 5.3;
+    ui.snapshot.audio.devicePeriodMs = 2.67;
     UINT pixelWidth = static_cast<UINT>(ui.width), pixelHeight = static_cast<UINT>(ui.height);
     IWICImagingFactory* wic = nullptr; IWICBitmap* bitmap = nullptr; ID2D1RenderTarget* target = nullptr;
     IWICStream* stream = nullptr; IWICBitmapEncoder* encoder = nullptr; IWICBitmapFrameEncode* frame = nullptr;

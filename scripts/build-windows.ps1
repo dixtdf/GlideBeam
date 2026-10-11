@@ -78,7 +78,7 @@ try {
  $taskResourceCompiler = if ($Architecture -eq 'arm64') { 'aarch64-w64-mingw32-windres.exe' } else { 'windres.exe' }
  & (Join-Path $taskCompilerBin $taskResourceCompiler) --codepage=65001 --include-dir apps/windows-client --input $taskGeneratedResource --output $taskResourceObject --output-format coff
  if ($LASTEXITCODE -ne 0) { throw 'Windows icon/version resource build failed' }
- $taskSources = @('apps/windows-client/main.cpp', 'apps/windows-client/smoke.cpp', 'apps/windows-client/decode-smoke.cpp', 'apps/windows-client/ui.cpp', 'apps/windows-client/ui-watchdog.cpp', 'apps/windows-client/session.cpp', 'apps/windows-client/exchange-windows.cpp', 'shared/exchange.cpp', 'shared/diagnostic-log.cpp', 'apps/windows-client/video.cpp')
+ $taskSources = @('apps/windows-client/main.cpp', 'apps/windows-client/smoke.cpp', 'apps/windows-client/decode-smoke.cpp', 'apps/windows-client/ui.cpp', 'apps/windows-client/ui-watchdog.cpp', 'apps/windows-client/session.cpp', 'apps/windows-client/exchange-windows.cpp', 'shared/exchange.cpp', 'shared/diagnostic-log.cpp', 'apps/windows-client/video.cpp', 'apps/windows-client/audio.cpp')
  if (Test-Path -LiteralPath 'shared/i18n.cpp') { $taskSources += 'shared/i18n.cpp' }
  $taskCompilerOptions = @('-std=c++20', '-O2', '-Wall', '-Wextra', '-Werror', '-DUNICODE', '-D_UNICODE', '-D_WIN32_WINNT=0x0A00', '-DWINVER=0x0A00', '-municode', '-mwindows')
  if ($Architecture -eq 'arm64') {
@@ -92,7 +92,7 @@ try {
   $taskCompilerOptions += @('-specs=apps/windows-client/native-manifest.specs', '-static-libgcc', '-static-libstdc++')
   $taskLinkResources = @($taskResourceObject)
  }
- & $taskCompiler @taskCompilerOptions @taskSources @taskLinkResources -o (Join-Path $taskOutput 'RemoteNative.exe') -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -limm32 -lshell32 -lole32 -loleaut32 -luuid -lstrmiids -lcrypt32 -ld3d11 -ldxgi -lmfplat -lmf -lmfuuid -lwmcodecdspuuid -lcomctl32
+ & $taskCompiler @taskCompilerOptions @taskSources @taskLinkResources -o (Join-Path $taskOutput 'RemoteNative.exe') -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -limm32 -lshell32 -lole32 -loleaut32 -luuid -lstrmiids -lcrypt32 -ld3d11 -ldxgi -lmfplat -lmf -lmfuuid -lwmcodecdspuuid -lcomctl32 -lavrt
  if ($LASTEXITCODE -ne 0) { throw 'Windows client build failed' }
  Copy-Item -LiteralPath $taskLibrary -Destination (Join-Path $taskOutput 'remote_transport.dll') -Force
  if ($Architecture -eq 'x64') {

@@ -15,6 +15,7 @@
 #include "capture-recovery.h"
 #include "mac-exchange.h"
 #include "restart-mac.h"
+#include "audio-capture.hpp"
 #include "../../shared/diagnostic-log.h"
 #include <atomic>
 #include <chrono>
@@ -407,6 +408,11 @@ struct QueuedInput { RemoteInputEvent event; std::vector<uint8_t> text; };
     std::atomic<void *> _captureSource;
     std::atomic<bool> _captureActive;
     std::atomic<int> _captureFrameState;
+    std::atomic<bool> _audioRequested, _audioAttached, _audioCapturing;
+    std::atomic<uint64_t> _audioEpoch, _audioPackets, _audioDropped, _audioMaxCallbackFrames;
+    remote_audio_capture::Packetizer _audioPacketizer;
+    uint64_t _audioPacketEpoch;
+    BOOL _audioCaptureDisabled;
     BOOL _stopping, _restartAfterStop;
     uint64_t _captureRetryAt;
     uint64_t _captureStopDeadline;
@@ -430,6 +436,7 @@ struct QueuedInput { RemoteInputEvent event; std::vector<uint8_t> text; };
     SCDisplay *_display;
     SCStreamConfiguration *_configuration;
     dispatch_queue_t _captureQueue;
+    dispatch_queue_t _audioQueue;
     NSStatusItem *_statusItem;
     NSMenuItem *_statusMenu, *_permissionsMenu, *_streamMenu;
     NSTimer *_timer;
@@ -469,6 +476,9 @@ struct QueuedInput { RemoteInputEvent event; std::vector<uint8_t> text; };
 - (uint64_t)invalidateCaptureSourceLocked;
 - (void)captureFailed:(NSError *)error stage:(NSString *)stage;
 - (void)captureFrameStatus:(SCFrameStatus)status stream:(SCStream *)stream;
+- (BOOL)handleAudioControl:(const uint8_t *)data length:(size_t)length;
+- (void)sendAudioStatus;
+- (void)captureAudio:(CMSampleBufferRef)sample stream:(SCStream *)stream;
 - (void)showWindow:(id)sender;
 - (void)requestPermissions:(id)sender;
 - (void)retryCapture:(id)sender;
@@ -584,6 +594,9 @@ static CGEventFlags ModifierFlag(int key) {
     _captureEpoch.store(1); _frameEpoch.store(1); _captureSource.store(nullptr);
     _captureActive.store(false); _captureFrameState.store(SCFrameStatusStopped);
     _captureState = @"idle";
+    _audioRequested.store(false); _audioAttached.store(false); _audioCapturing.store(false);
+    _audioEpoch.store(1); _audioPacketEpoch=0; _audioPackets.store(0); _audioDropped.store(0); _audioMaxCallbackFrames.store(0);
+    _audioCaptureDisabled=NO;
     _width = 1920; _height = 1080; _displayBounds = CGDisplayBounds(CGMainDisplayID());
     _encoderFps = 60; _encoderID = @""; _encoderMode.store(H264EncoderMode::Unavailable);
     _consecutiveEncodeFailures.store(0); _encoderRecoveryScheduled.store(false);
@@ -592,6 +605,7 @@ static CGEventFlags ModifierFlag(int key) {
     _modifiers = 0; _hasSequence = false; _lastSequence = 0;
     for (int i=0;i<3;++i) _buttons[i] = false;
     _captureQueue = dispatch_queue_create("remote.capture", DISPATCH_QUEUE_SERIAL);
+    _audioQueue = dispatch_queue_create("remote.audio.capture", DISPATCH_QUEUE_SERIAL);
     return self;
 }
 - (void)installLocalizedMenus {
@@ -704,6 +718,8 @@ static CGEventFlags ModifierFlag(int key) {
             if (state != previous) {
                 bool disconnected = previous == 1 && state != 1;
                 previous = state;
+                self->_audioRequested.store(false);
+                self->_audioEpoch.fetch_add(1);
                 dispatch_async(dispatch_get_main_queue(), ^{
                     if (disconnected) [self releaseAll];
                     if (state == 1) { self->_previousCursor = nil; self->_forceKeyframe.store(true); [self sendStatus:@"Connected"]; }
@@ -719,7 +735,8 @@ static CGEventFlags ModifierFlag(int key) {
                 int bytes = remote_poll(self->_endpoint,&channel,buffer.data(),buffer.size());
                 if (bytes <= 0) break;
                 if(channel==REMOTE_CONTROL) {
-                    if(self->_restart && remote_status(self->_endpoint)==1)self->_restart->Handle(buffer.data(),(size_t)bytes);
+                    if(remote_status(self->_endpoint)==1 && ![self handleAudioControl:buffer.data() length:(size_t)bytes] && self->_restart)
+                        self->_restart->Handle(buffer.data(),(size_t)bytes);
                     continue;
                 }
                 if (channel != REMOTE_INPUT || (size_t)bytes < sizeof(RemoteInputEvent)) continue;
@@ -814,6 +831,10 @@ static CGEventFlags ModifierFlag(int key) {
             @"captured":@(_captured.load()), @"encoded":@(_encoded.load()),
             @"dropped":@(_dropped.load()), @"encoded_bytes":@(_encodedBytes.load()),
             @"encode_failures":@(_encodeFailures.load()),
+            @"audio_supported":@YES, @"audio_codec":@"pcm-s16le", @"audio_packet_ms":@5,
+            @"audio_state":(!_audioRequested.load() ? @"stopped" : (_audioAttached.load() && _audioCapturing.load() ? @"running" : @"unavailable")),
+            @"audio_packets":@(_audioPackets.load()), @"audio_dropped":@(_audioDropped.load()),
+            @"audio_max_callback_frames":@(_audioMaxCallbackFrames.load()),
             @"restart_supported":@YES, @"restart_requires_local_authorization":@YES,
             @"restart_busy":@(_restart && _restart->Busy()),
             @"accessibility":@(CGPreflightPostEventAccess()), @"screen_recording":@(CGPreflightScreenCaptureAccess()) };
@@ -994,6 +1015,7 @@ static CGEventFlags ModifierFlag(int key) {
 }
 - (void)retryCapture:(id)sender {
     if (!CGPreflightScreenCaptureAccess()) { [self requestPermissions:nil]; return; }
+    _audioCaptureDisabled=NO;
     [self restartCapture];
 }
 - (void)restartCapture {
@@ -1080,6 +1102,106 @@ static CGEventFlags ModifierFlag(int key) {
         if (_endpoint && _connection.load()==1)remote_send(_endpoint,REMOTE_CURSOR,(const uint8_t *)&header,sizeof(header));
     }
 }
+- (BOOL)handleAudioControl:(const uint8_t *)data length:(size_t)length {
+    @autoreleasepool {
+    if(!data || !length || length>4096 || !_running.load() || remote_status(_endpoint)!=1) return NO;
+    NSData *payload=[NSData dataWithBytes:data length:length];
+    id decoded=[NSJSONSerialization JSONObjectWithData:payload options:0 error:nil];
+    if(![decoded isKindOfClass:NSDictionary.class])return NO;
+    NSDictionary *command=decoded;
+    id type=command[@"type"];
+    if(![type isKindOfClass:NSString.class] ||
+       (![(NSString *)type isEqualToString:@"audio-start"] && ![(NSString *)type isEqualToString:@"audio-stop"]))return NO;
+    id version=command[@"version"];
+    if(![version isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)version)==CFBooleanGetTypeID() ||
+       strcmp([(NSNumber *)version objCType],@encode(float))==0 || strcmp([(NSNumber *)version objCType],@encode(double))==0 ||
+       [(NSNumber *)version unsignedLongLongValue]!=1)return YES;
+    _audioRequested.store([(NSString *)type isEqualToString:@"audio-start"]);
+    _audioEpoch.fetch_add(1); // A new subscription never reuses the previous partial packet.
+    [self sendAudioStatus];
+    return YES;
+    }
+}
+- (void)sendAudioStatus {
+    @autoreleasepool {
+    if(!_running.load() || !_endpoint || remote_status(_endpoint)!=1)return;
+    NSString *state=!_audioRequested.load() ? @"stopped" :
+        (_audioAttached.load() && _audioCapturing.load() ? @"running" : @"unavailable");
+    NSDictionary *status=@{ @"type":@"audio-status", @"version":@1, @"state":state,
+        @"codec":@"pcm-s16le", @"sample_rate":@48000, @"channels":@2, @"packet_ms":@5 };
+    NSData *data=[NSJSONSerialization dataWithJSONObject:status options:0 error:nil];
+    if(data)remote_send(_endpoint,REMOTE_CONTROL,(const uint8_t *)data.bytes,data.length);
+    }
+}
+- (void)captureAudio:(CMSampleBufferRef)sample stream:(SCStream *)stream {
+    // This method runs only on _audioQueue. Epoch checks isolate source changes,
+    // subscriptions and reconnects without taking the video's lifecycle lock.
+    uint64_t epoch=_audioEpoch.load();
+    if(_audioPacketEpoch!=epoch){_audioPacketizer.Reset();_audioPacketEpoch=epoch;}
+    if(!_running.load() || !_audioRequested.load() || !_audioAttached.load() || !_audioCapturing.load() ||
+       _connection.load()!=1 || _captureSource.load()!=(__bridge void *)stream)return;
+    if(!CMSampleBufferIsValid(sample) || !CMSampleBufferDataIsReady(sample))return;
+    CMItemCount samples=CMSampleBufferGetNumSamples(sample);
+    if(samples==0)return;
+    if(samples>0) {
+        auto maximum=_audioMaxCallbackFrames.load();
+        while(static_cast<uint64_t>(samples)>maximum &&
+              !_audioMaxCallbackFrames.compare_exchange_weak(maximum,static_cast<uint64_t>(samples))) {}
+    }
+    CMFormatDescriptionRef description=CMSampleBufferGetFormatDescription(sample);
+    const AudioStreamBasicDescription *format=description && CMFormatDescriptionGetMediaType(description)==kCMMediaType_Audio ?
+        CMAudioFormatDescriptionGetStreamBasicDescription(description) : nullptr;
+    bool planar=format && (format->mFormatFlags & kAudioFormatFlagIsNonInterleaved);
+    bool supported=format && format->mFormatID==kAudioFormatLinearPCM &&
+        std::isfinite(format->mSampleRate) && std::fabs(format->mSampleRate-48000.0)<0.001 &&
+        format->mChannelsPerFrame==2 && format->mBitsPerChannel==32 &&
+        (format->mFormatFlags & kAudioFormatFlagIsFloat) && (format->mFormatFlags & kAudioFormatFlagIsPacked) &&
+        !(format->mFormatFlags & (kAudioFormatFlagIsBigEndian|kAudioFormatFlagIsAlignedHigh)) &&
+        format->mBytesPerFrame==(planar ? 4u : 8u) && format->mFramesPerPacket==1 &&
+        samples>0 && samples<=4800;
+    // Space for the supported two planar buffers; larger/unexpected formats are
+    // rejected rather than reading past an AudioBufferList or sending noise.
+    struct AudioStorage { AudioBufferList list; AudioBuffer extra; } storage{};
+    static_assert(offsetof(AudioStorage,extra)==offsetof(AudioBufferList,mBuffers)+sizeof(AudioBuffer));
+    CMBlockBufferRef retained=nullptr;
+    OSStatus copied=supported ? CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sample,nullptr,
+        &storage.list,sizeof(storage),kCFAllocatorDefault,kCFAllocatorDefault,0,&retained) : -1;
+    struct BlockOwner { CMBlockBufferRef value; ~BlockOwner(){if(value)CFRelease(value);} } block{retained};
+    AudioBufferList& buffers=storage.list;
+    auto* audioBuffers=reinterpret_cast<AudioBuffer*>(reinterpret_cast<uint8_t*>(&storage)+offsetof(AudioBufferList,mBuffers));
+    supported=supported && copied==noErr && buffers.mNumberBuffers==(planar ? 2u : 1u) &&
+        audioBuffers[0].mNumberChannels==(planar ? 1u : 2u);
+    const AudioBuffer *second=planar && buffers.mNumberBuffers==2 ? &audioBuffers[1] : nullptr;
+    supported=supported && (!planar || (second && second->mNumberChannels==1));
+    CMTime pts=CMSampleBufferGetPresentationTimeStamp(sample);
+    double seconds=CMTimeGetSeconds(pts);
+    supported=supported && CMTIME_IS_NUMERIC(pts) && std::isfinite(seconds) && seconds>=0 &&
+        seconds<static_cast<double>(std::numeric_limits<uint64_t>::max()/1000000ULL);
+    if(supported) {
+        supported=_audioPacketizer.PushFloat32(audioBuffers[0].mData,audioBuffers[0].mDataByteSize,
+            second ? second->mData : nullptr,second ? second->mDataByteSize : 0,
+            static_cast<size_t>(samples),planar,static_cast<uint64_t>(seconds*1000000.0),
+            [self,stream,epoch](const uint8_t* data,size_t size) {
+                if(!self->_running.load() || !self->_audioRequested.load() || self->_audioEpoch.load()!=epoch ||
+                   self->_connection.load()!=1 || self->_captureSource.load()!=(__bridge void *)stream)return -1;
+                int accepted=remote_audio_send(self->_endpoint,data,size);
+                if(accepted==1)self->_audioPackets.fetch_add(1);else self->_audioDropped.fetch_add(1);
+                return accepted;
+            });
+    }
+    if(!supported && _audioEpoch.load()==epoch && _captureSource.load()==(__bridge void *)stream) {
+        _audioPacketizer.Reset();
+        dispatch_async(dispatch_get_main_queue(),^{
+            // Serialize lifecycle changes with start/stop and reject old callbacks
+            // again after crossing from the sample queue to the main queue.
+            if(!self->_running.load() || self->_audioEpoch.load()!=epoch ||
+               self->_captureSource.load()!=(__bridge void *)stream)return;
+            self->_audioAttached.store(false); self->_audioEpoch.fetch_add(1);
+            remote_log::Write(remote_log::Level::Warning,"audio","unsupported or invalid capture sample; audio unavailable, video continues");
+            [self sendAudioStatus];
+        });
+    }
+}
 - (void)startCapture {
     if (_starting || _capturing || _stopping || !_running.load()) return;
     if (!_endpoint) { [self sendStatus:@"Transport unavailable; restart the host after fixing startup"]; return; }
@@ -1116,7 +1238,10 @@ static CGEventFlags ModifierFlag(int key) {
             self->_configuration.pixelFormat=kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
             self->_configuration.queueDepth=3; self->_configuration.minimumFrameInterval=CMTimeMake(1,self->_encoderFps);
             self->_configuration.showsCursor=self->_cursorBaked;
-            self->_configuration.capturesAudio=NO;
+            self->_configuration.capturesAudio=!self->_audioCaptureDisabled;
+            self->_configuration.sampleRate=48000;
+            self->_configuration.channelCount=2;
+            self->_configuration.excludesCurrentProcessAudio=YES;
             SCContentFilter *filter=[[SCContentFilter alloc] initWithDisplay:self->_display excludingWindows:@[]];
             self->_stream=[[SCStream alloc] initWithFilter:filter configuration:self->_configuration delegate:self];
             SCStream *newStream=self->_stream;
@@ -1128,20 +1253,41 @@ static CGEventFlags ModifierFlag(int key) {
             if(![self->_stream addStreamOutput:self type:SCStreamOutputTypeScreen sampleHandlerQueue:self->_captureQueue error:&attachError]) {
                 [self captureFailed:attachError stage:@"Capture attachment failed"]; return;
             }
+            self->_audioAttached.store(false);
+            if(!self->_audioCaptureDisabled) {
+                NSError *audioError=nil;
+                if([self->_stream addStreamOutput:self type:SCStreamOutputTypeAudio sampleHandlerQueue:self->_audioQueue error:&audioError])
+                    self->_audioAttached.store(true);
+                else {
+                    remote_log::Write(remote_log::Level::Warning,"audio","audio output attachment failed; restarting capture without audio");
+                    self->_audioCaptureDisabled=YES;
+                    [self sendAudioStatus]; [self restartCapture]; return;
+                }
+            }
             [self->_stream startCaptureWithCompletionHandler:^(NSError *startError){
                 dispatch_async(dispatch_get_main_queue(),^{
                     if(epoch!=self->_captureEpoch.load() || self->_captureSource.load()!=(__bridge void *)newStream || !self->_running.load()) return;
-                    if(startError) { [self captureFailed:startError stage:@"Capture start error"]; return; }
+                    if(startError) {
+                        if(!self->_audioCaptureDisabled && [startError.domain isEqualToString:SCStreamErrorDomain] &&
+                           startError.code==SCStreamErrorFailedToStartAudioCapture) {
+                            remote_log::Write(remote_log::Level::Warning,"audio","system audio could not start; restarting capture without audio");
+                            self->_audioCaptureDisabled=YES; [self sendAudioStatus]; [self restartCapture]; return;
+                        }
+                        [self captureFailed:startError stage:@"Capture start error"]; return;
+                    }
                     self->_starting=NO; self->_capturing=YES; self->_captureBlocked=NO;
+                    self->_audioCapturing.store(true);
                     self->_captureRetryAt=0; self->_forceKeyframe.store(true);
                     [self captureFrameStatus:(SCFrameStatus)self->_captureFrameState.load() stream:newStream];
                     [self sendStatus:self->_captureStatus ?: [self encoderStreamingStatus]];
+                    if(self->_audioRequested.load())[self sendAudioStatus];
                 });
             }];
         });
     }];
 }
 - (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sample ofType:(SCStreamOutputType)type {
+    if(type==SCStreamOutputTypeAudio){[self captureAudio:sample stream:stream];return;}
     if(type!=SCStreamOutputTypeScreen || !CMSampleBufferIsValid(sample))return;
     std::lock_guard captureLock(_captureLock);
     if(_captureSource.load()!=(__bridge void *)stream)return;
@@ -1170,6 +1316,12 @@ static CGEventFlags ModifierFlag(int key) {
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
     dispatch_async(dispatch_get_main_queue(),^{
         if(self->_captureSource.load()!=(__bridge void *)stream) return;
+        if(!self->_audioCaptureDisabled && [error.domain isEqualToString:SCStreamErrorDomain] &&
+           (error.code==SCStreamErrorFailedToStartAudioCapture || error.code==SCStreamErrorFailedToStopAudioCapture)) {
+            self->_audioCaptureDisabled=YES;
+            remote_log::Write(remote_log::Level::Warning,"audio","system audio capture stopped; restoring video without audio");
+            [self sendAudioStatus]; [self restartCapture]; return;
+        }
         [self captureFailed:error stage:@"Capture stopped"];
     });
 }
@@ -1204,6 +1356,7 @@ static CGEventFlags ModifierFlag(int key) {
     if(_stopping) return;
     uint64_t epoch;
     { std::lock_guard captureLock(_captureLock); epoch=[self invalidateCaptureSourceLocked]; }
+    if(_audioRequested.load())[self sendAudioStatus];
     // VT drain can synchronously invoke EncodedCallback. Never hold captureLock
     // while taking/draining the encoder; that callback needs the lifecycle gate.
     { std::lock_guard lock(_encoderLock);
@@ -1224,6 +1377,7 @@ static CGEventFlags ModifierFlag(int key) {
 }
 - (uint64_t)invalidateCaptureSourceLocked {
     _capturing=NO; _starting=NO; _captureActive.store(false);
+    _audioAttached.store(false); _audioCapturing.store(false); _audioEpoch.fetch_add(1);
     uint64_t epoch=_captureEpoch.fetch_add(1)+1;
     _captureSource.store(nullptr);
     _captureFrameState.store(SCFrameStatusStopped);
@@ -1370,6 +1524,9 @@ static CGEventFlags ModifierFlag(int key) {
     _restart.reset(); // Cancel any unapproved authorization before closing its transport.
     if(_bulkThread.joinable())_bulkThread.join();
     if(_encodeThread.joinable())_encodeThread.join();
+    // Drain already admitted audio callbacks before the shared C handle closes.
+    // Future callbacks see _running=false and cannot enter the transport.
+    dispatch_sync(_audioQueue,^{});
     RetireEncoder(_encoder,_encoderFlight);
     _captureFrames.Reset(0);
     _nativeExchange.reset(); _exchange.reset();

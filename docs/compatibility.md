@@ -27,7 +27,7 @@ Dedicated-window input testing received a mouse-down, scroll, fixed Unicode text
 
 ## Current boundaries
 
-Single display, an already logged-in user desktop, LAN access, text/PNG clipboard, and on-demand two-way file transfer are the current scope. Audio, rich text, directory mirroring, deletion through cross-machine cut, login-before-user control, and public relay/NAT traversal are not implemented. Closing the host window leaves the menu-bar agent running. Start at login starts after that user logs in.
+Single display, an already logged-in user desktop, LAN access, text/PNG clipboard, and on-demand two-way file transfer are the current scope. The audio development branch, tested as `0.3.0-dev.audio`, adds Mac system sound with updated endpoints; published `v0.2.1` has no audio. A working Core Audio output device is required. Its raw PCM mode uses about 1.5 Mbps before overhead. The Intel Mac / Windows x64 setup passed a 30-second capture-to-WASAPI test with zero source underruns or observed device depletion; playback was muted, so listening quality and capture-to-speaker latency remain unmeasured. See [audio setup and validation](audio.md). Microphone forwarding, rich text, directory mirroring, deletion through cross-machine cut, login-before-user control, and public relay/NAT traversal are not implemented. Closing the host window leaves the menu-bar agent running. Start at login starts after that user logs in.
 
 Disconnecting does not actively lock the Mac. Screen saver, power, and password policies are controlled by macOS. A target frame rate of 60 FPS does not guarantee delivered FPS or total input-to-display latency. Static screens can produce very few new capture frames without indicating a transport fault.
 

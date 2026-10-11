@@ -6,7 +6,7 @@ use std::{
 
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 pub const HEADER: usize = 24;
-const MAGIC: u32 = 0x31474452; // RDG1
+pub const MAGIC: u32 = 0x31474452; // RDG1
 const MAX_IN_FLIGHT: usize = 3;
 const TTL: Duration = Duration::from_millis(120);
 
