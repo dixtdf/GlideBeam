@@ -264,7 +264,7 @@ struct Ui {
         paint.Text(L"让每一次操作，都更跟手。", 25, height - 96, 170, 22, 11, MUTED);
         paint.Dot(29, height - 53, 3, ACCENT);
         paint.Text(L"局域网直连", 40, height - 67, 148, 28, 10, MUTED, true);
-        paint.Text(L"v0.2.0", 145, height - 36, 48, 15, 9, 0x516275);
+        paint.Text(L"v0.2.1", 145, height - 36, 48, 15, 9, 0x516275);
     }
     void Field(float x, float y, float w, const wchar_t* label, const wchar_t* hint, bool password = false) {
         paint.Text(label, x, y, w, 20, 11, MUTED, true);

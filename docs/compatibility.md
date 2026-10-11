@@ -23,7 +23,7 @@ A narrow NV12 layout workaround is gated by the SHA-256 of a recognized loaded N
 
 On the reference RTX 3060 VM with NullMoth 1.10.0, hardware encoder creation returned `-12908` and this change selected Apple's software H.264 encoder. A 1920 × 1080, 30-frame codec test passed moving-marker and decoded-pixel checks, including the production single-frame submission path. Windows' production GPU decoder also passed a 30-record fixture test with 29 frames actually presented. A separate 30-second animated desktop session presented 795 frames, used Windows GPU decoding, and reported approximately 29 FPS after startup. The first hardware-decoded frame took 1375 ms in that run. These short tests do not qualify sustained performance or total input latency; an earlier animation run had a long pause that did not recur in the final run.
 
-Dedicated-window input testing received a mouse-down, scroll, fixed Unicode text, and paired key events, with Shift released. Its local monitor did not observe mouse-up; broad application input and subjective pointer feel remain unqualified. The software fallback is a source change and deployment validation, separate from the already published 0.2.0 download.
+Dedicated-window input testing received a mouse-down, scroll, fixed Unicode text, and paired key events, with Shift released. Its local monitor did not observe mouse-up; broad application input and subjective pointer feel remain unqualified. The software fallback and encoder-mode diagnostics are included in 0.2.1; earlier 0.2.0 builds do not contain these changes.
 
 ## Current boundaries
 

@@ -2,8 +2,8 @@
 IDI_REMOTE_NATIVE ICON "../../assets/app-icon.ico"
 1 24 "RemoteNative.manifest"
 1 VERSIONINFO
- FILEVERSION 0,2,0,0
- PRODUCTVERSION 0,2,0,0
+ FILEVERSION 0,2,1,0
+ PRODUCTVERSION 0,2,1,0
  FILEOS 0x40004L
  FILETYPE 0x1L
 BEGIN
@@ -12,9 +12,9 @@ BEGIN
   BLOCK "040904b0"
   BEGIN
    VALUE "FileDescription", "GlideBeam Windows Client\0"
-   VALUE "FileVersion", "0.2.0\0"
+   VALUE "FileVersion", "0.2.1\0"
    VALUE "ProductName", "GlideBeam\0"
-   VALUE "ProductVersion", "0.2.0\0"
+   VALUE "ProductVersion", "0.2.1\0"
   END
  END
  BLOCK "VarFileInfo"
