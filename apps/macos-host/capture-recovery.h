@@ -25,28 +25,30 @@ inline uint64_t CaptureRetryDelayUs(unsigned attempt) {
 class CaptureFrameMailbox {
     std::mutex mutex_;
     CVPixelBufferRef pixel_ = nullptr;
-    uint64_t epoch_ = 1, serial_ = 0, consumed_ = 0, capturedUs_ = 0;
+    uint64_t epoch_ = 1, serial_ = 0, consumed_ = 0, capturedUs_ = 0, enqueuedUs_ = 0;
 public:
     ~CaptureFrameMailbox() { Reset(0); }
     void Reset(uint64_t epoch) {
         std::lock_guard lock(mutex_);
         if (pixel_) CVPixelBufferRelease(pixel_);
-        pixel_ = nullptr; epoch_ = epoch; serial_ = consumed_ = capturedUs_ = 0;
+        pixel_ = nullptr; epoch_ = epoch; serial_ = consumed_ = capturedUs_ = enqueuedUs_ = 0;
     }
-    bool Publish(uint64_t epoch, CVPixelBufferRef pixel, uint64_t capturedUs, bool& replaced) {
+    bool Publish(uint64_t epoch, CVPixelBufferRef pixel, uint64_t capturedUs, bool& replaced, uint64_t enqueuedUs = 0) {
         if (!pixel) return false;
         std::lock_guard lock(mutex_);
         if (epoch != epoch_) return false;
         replaced = pixel_ && serial_ != consumed_;
         CVPixelBufferRetain(pixel);
         if (pixel_) CVPixelBufferRelease(pixel_);
-        pixel_ = pixel; capturedUs_ = capturedUs; ++serial_;
+        pixel_ = pixel; capturedUs_ = capturedUs; enqueuedUs_ = enqueuedUs; ++serial_;
         return true;
     }
-    CVPixelBufferRef Take(uint64_t epoch, bool force, uint64_t& capturedUs) {
+    CVPixelBufferRef Take(uint64_t epoch, bool force, uint64_t& capturedUs, uint64_t *enqueuedUs = nullptr, bool *fresh = nullptr) {
         std::lock_guard lock(mutex_);
         if (epoch != epoch_ || !pixel_ || (!force && serial_ == consumed_)) return nullptr;
+        if(fresh) *fresh = serial_ != consumed_;
         consumed_ = serial_; capturedUs = capturedUs_;
+        if(enqueuedUs) *enqueuedUs = enqueuedUs_;
         return CVPixelBufferRetain(pixel_);
     }
 };

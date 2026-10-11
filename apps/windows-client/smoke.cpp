@@ -20,6 +20,46 @@
 #include <vector>
 
 namespace {
+std::string StageTimingJson(const HostStageTiming& timing){
+    std::ostringstream json;json<<std::fixed<<std::setprecision(3)
+        <<"{\"available\":"<<(timing.available?"true":"false")<<",\"samples\":"<<timing.samples
+        <<",\"window_samples\":"<<timing.windowSamples<<",\"last_ms\":"<<timing.lastMs
+        <<",\"mean_ms\":"<<timing.meanMs<<",\"p95_ms\":"<<timing.p95Ms
+        <<",\"p99_ms\":"<<timing.p99Ms<<",\"max_ms\":"<<timing.maxMs<<"}";return json.str();
+}
+std::string StageTimingJson(const LatencySnapshot& timing){
+    HostStageTiming value;value.available=timing.windowSamples>0;value.samples=timing.totalSamples;
+    value.windowSamples=static_cast<uint32_t>(timing.windowSamples);value.lastMs=timing.lastUs/1000.0;
+    value.meanMs=timing.meanUs/1000.0;value.p95Ms=timing.p95Us/1000.0;
+    value.p99Ms=timing.p99Us/1000.0;value.maxMs=timing.maxUs/1000.0;return StageTimingJson(value);
+}
+std::string VideoTimingJson(const SessionSnapshot& snapshot){
+    const auto& host=snapshot.hostVideoTiming;const auto& client=snapshot.videoTiming;
+    std::ostringstream json;
+    json<<"{\"measurement\":\"Local monotonic wall-clock intervals and API call durations, nearest-rank percentiles over at most 256 recent samples. Receive interval starts when the transport poll delivers a reassembled frame; Present interval counts successful submissions. These are not GPU completion, scanout, network one-way or end-to-end latency. Host video send acceptance means bounded queue acceptance, not delivery.\","
+        <<"\"host\":{\"counters_available\":"<<(host.countersAvailable?"true":"false")
+        <<",\"capture_callbacks\":"<<host.captureCallbacks<<",\"capture_complete\":"<<host.captureComplete
+        <<",\"capture_idle\":"<<host.captureIdle<<",\"video_send_accepted\":"<<host.videoSendAccepted
+        <<",\"video_send_rejected\":"<<host.videoSendRejected
+        <<",\"capture_interval\":"<<StageTimingJson(host.captureInterval)
+        <<",\"capture_complete_interval\":"<<StageTimingJson(host.captureCompleteInterval)
+        <<",\"mailbox_wait\":"<<StageTimingJson(host.mailboxWait)<<",\"prepack\":"<<StageTimingJson(host.prepack)
+        <<",\"vt_submit\":"<<StageTimingJson(host.vtSubmit)<<",\"encode_callback\":"<<StageTimingJson(host.encodeCallback)
+        <<",\"video_send\":"<<StageTimingJson(host.videoSend)<<"},\"client\":{"
+        <<"\"decoded_frames\":"<<client.decodedFrames<<",\"pending_replaced\":"<<client.pendingReplaced
+        <<",\"present_wait_timeouts\":"<<client.presentWaitTimeouts<<",\"present_busy\":"<<client.presentBusy
+        <<",\"present_occluded\":"<<client.presentOccluded
+        <<",\"receive_interval\":"<<StageTimingJson(client.receiveInterval)
+        <<",\"worker_wait\":"<<StageTimingJson(client.workerWait)
+        <<",\"worker_wait_mode\":\""<<(client.workerWait.windowSamples?(client.workerHighResolutionWait?"high-resolution-timer":"sleep-fallback"):"unobserved")<<"\""
+        <<",\"worker_fallback_waits\":"<<client.workerFallbackWaits<<",\"worker_timer_failures\":"<<client.workerTimerFailures
+        <<",\"decode_input_call\":"<<StageTimingJson(client.decodeInput)
+        <<",\"decode_output_call\":"<<StageTimingJson(client.decodeOutput)
+        <<",\"conversion_submit\":"<<StageTimingJson(client.conversionSubmit)
+        <<",\"present_wait\":"<<StageTimingJson(client.presentWait)<<",\"present_call\":"<<StageTimingJson(client.presentCall)
+        <<",\"frame_process\":"<<StageTimingJson(client.frameProcess)<<",\"pending_wait\":"<<StageTimingJson(client.pendingWait)
+        <<",\"present_interval\":"<<StageTimingJson(client.presentInterval)<<"}}";return json.str();
+}
 constexpr wchar_t kSmokeClass[] = L"RemoteNativeDiagnostic";
 struct SmokeContext {
     IClientSession* session = nullptr;
@@ -83,6 +123,33 @@ std::string Number(double value) {
     if (!std::isfinite(value) || value < 0) return "null";
     std::ostringstream output; output << std::fixed << std::setprecision(3) << value;
     return output.str();
+}
+std::string AudioTimingJson(const SessionSnapshot& snapshot) {
+    const auto& audio = snapshot.audio;
+    const char* state = "stopped";
+    switch (audio.state) {
+        case AudioPlaybackState::Waiting: state = "waiting"; break;
+        case AudioPlaybackState::Playing: state = "playing"; break;
+        case AudioPlaybackState::Muted: state = "muted"; break;
+        case AudioPlaybackState::Unavailable: state = "unavailable"; break;
+        case AudioPlaybackState::Stopped: break;
+    }
+    std::ostringstream drift;
+    if (std::isfinite(audio.driftPpm)) drift << std::fixed << std::setprecision(3) << audio.driftPpm;
+    else drift << "null";
+    // Metadata only: no PCM payload, clipboard contents or device error paths.
+    std::ostringstream json;
+    json << "{\"host_state\":\"" << Escape(snapshot.macAudioState) << "\",\"state\":\"" << state
+         << "\",\"sample_rate\":" << audio.sampleRate << ",\"channels\":" << audio.channels
+         << ",\"queue_ms\":" << Number(audio.queueMs) << ",\"target_ms\":" << Number(audio.targetMs)
+         << ",\"device_period_ms\":" << Number(audio.devicePeriodMs)
+         << ",\"device_queued_ms\":" << Number(audio.deviceQueuedMs) << ",\"drift_ppm\":" << drift.str()
+         << ",\"underruns\":" << audio.underruns << ",\"device_underruns\":" << audio.deviceUnderruns
+         << ",\"lost\":" << audio.lost << ",\"late\":" << audio.late << ",\"discarded\":" << audio.discarded
+         << ",\"rendered_frames\":" << audio.renderedFrames << ",\"received_packets\":" << audio.receivedPackets
+         << ",\"device_restarts\":" << audio.deviceRestarts << ",\"muted\":" << (audio.muted ? "true" : "false")
+         << ",\"low_latency\":" << (audio.lowLatency ? "true" : "false") << "}";
+    return json.str();
 }
 bool WriteReport(const wchar_t* path, const std::string& contents) {
     HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -233,6 +300,8 @@ int RunConnectionSmoke(HINSTANCE instance, unsigned seconds, const wchar_t* repo
          << ",\n  \"fps\": " << Number(final.fps) << ",\n  \"bitrate_mbps\": " << Number(final.bitrateMbps)
          << ",\n  \"network_rtt_ms\": " << Number(final.networkMs) << ",\n  \"decode_present_ms\": " << Number(final.decodeMs)
          << ",\n  \"decode_present_measurement\": \"CPU wall-clock time across decode, GPU conversion submission and DXGI Present; includes any presentation wait, not a GPU duration\""
+         << ",\n  \"video_timing\": " << VideoTimingJson(final)
+         << ",\n  \"audio_timing\": " << AudioTimingJson(final)
          << ",\n  \"queued_video_frames\": " << final.queuedFrames
          << ",\n  \"file_load_requested\": " << (transferRequested ? "true" : "false")
          << ",\n  \"file_load_state\": \"" << remote_exchange::StateLabel(transferState) << "\""
@@ -251,7 +320,9 @@ int RunConnectionSmoke(HINSTANCE instance, unsigned seconds, const wchar_t* repo
         json << (i ? "," : "") << "\n    {\"at_ms\":" << Number(sample.at) << ",\"state\":\"" << StateName(snapshot.state)
              << "\",\"actual_frames\":" << snapshot.actualFrames << ",\"hardware_decode\":" << (snapshot.hardwareDecode ? "true" : "false")
              << ",\"fps\":" << Number(snapshot.fps) << ",\"network_rtt_ms\":" << Number(snapshot.networkMs)
-             << ",\"decode_present_ms\":" << Number(snapshot.decodeMs) << ",\"queued_frames\":" << snapshot.queuedFrames << "}";
+             << ",\"decode_present_ms\":" << Number(snapshot.decodeMs) << ",\"queued_frames\":" << snapshot.queuedFrames
+             << ",\"video_timing\":" << VideoTimingJson(snapshot)
+             << ",\"audio_timing\":" << AudioTimingJson(snapshot) << "}";
     }
     json << "\n  ]\n}\n";
     bool written = WriteReport(reportPath, json.str());

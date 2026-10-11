@@ -31,6 +31,10 @@ struct VideoDecoder::Impl {
     uint64_t lastSequence=0;
     bool seenSequence=false;
     double decodeMs=0;
+    RollingLatencyStats decodeInputStats,decodeOutputStats,conversionStats,presentWaitStats,presentCallStats;
+    RollingLatencyStats frameProcessStats,pendingWaitStats,presentIntervalStats;
+    uint64_t decodedFrames=0,pendingReplaced=0,presentWaitTimeouts=0,presentBusy=0,presentOccluded=0;
+    std::chrono::steady_clock::time_point pendingSince{},lastPresentedAt{};
     std::string error;
     Com<ID3D11Device> device;
     Com<ID3D11DeviceContext> context;
@@ -45,6 +49,9 @@ struct VideoDecoder::Impl {
     Com<ID3D11VideoProcessor> processor;
     HANDLE latency=nullptr;
     uint32_t vpInputWidth=0,vpInputHeight=0;
+    static uint64_t elapsedUs(std::chrono::steady_clock::time_point start){
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-start).count());
+    }
     bool fail(const char* operation,HRESULT hr){char b[240];snprintf(b,sizeof(b),"%s (0x%08lx)",operation,(unsigned long)hr);error=b;return false;}
     bool outputType(){
         for(DWORD i=0;i<30;i++){
@@ -77,8 +84,10 @@ struct VideoDecoder::Impl {
         // Keep decoding reference frames when the compositor is busy, but do not
         // block the video worker behind a background/occluded window's refresh.
         if(latency){
+            auto waitStart=std::chrono::steady_clock::now();
             DWORD ready=WaitForSingleObject(latency,2);
-            if(ready==WAIT_TIMEOUT)return true;
+            presentWaitStats.ObserveUs(elapsedUs(waitStart));
+            if(ready==WAIT_TIMEOUT){++presentWaitTimeouts;return true;}
             if(ready!=WAIT_OBJECT_0)return fail("Wait for video presentation",HRESULT_FROM_WIN32(GetLastError()));
         }
         Com<IMFMediaBuffer> buffer;
@@ -139,18 +148,27 @@ struct VideoDecoder::Impl {
         D3D11_VIDEO_PROCESSOR_COLOR_SPACE color{};color.YCbCr_Matrix=1;color.Nominal_Range=D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
         videoContext->VideoProcessorSetStreamColorSpace(processor.p,0,&color);
         D3D11_VIDEO_PROCESSOR_STREAM stream{};stream.Enable=TRUE;stream.pInputSurface=input.p;
+        auto conversionStart=std::chrono::steady_clock::now();
         hr=videoContext->VideoProcessorBlt(processor.p,output.p,0,1,&stream);
+        conversionStats.ObserveUs(elapsedUs(conversionStart));
         if(FAILED(hr))return fail("GPU video conversion",hr);
+        auto presentStart=std::chrono::steady_clock::now();
         hr=swap->Present(0,DXGI_PRESENT_DO_NOT_WAIT);
-        if(hr==DXGI_ERROR_WAS_STILL_DRAWING)return true;
+        presentCallStats.ObserveUs(elapsedUs(presentStart));
+        if(hr==DXGI_ERROR_WAS_STILL_DRAWING){++presentBusy;return true;}
         if(FAILED(hr))return fail("Present video",hr);
-        if(hr==DXGI_STATUS_OCCLUDED)return true;
+        if(hr==DXGI_STATUS_OCCLUDED){++presentOccluded;return true;}
+        auto now=std::chrono::steady_clock::now();
+        if(lastPresentedAt!=std::chrono::steady_clock::time_point{})
+            presentIntervalStats.ObserveUs(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now-lastPresentedAt).count()));
+        lastPresentedAt=now;
         presented++;shown=true;return true;
     }
     bool retryPending(){
         if(!pending.p)return true;
         bool shown=false;
         bool ok=present(pending.p,shown);
+        if(shown)pendingWaitStats.ObserveUs(elapsedUs(pendingSince));
         if(shown || !ok)pending.reset();
         return ok;
     }
@@ -158,8 +176,11 @@ struct VideoDecoder::Impl {
         // Retain exactly one DXGI-backed decoder sample. Replacing it releases
         // the old surface, while the decoder continues maintaining references.
         sample->AddRef();
+        if(pending.p)++pendingReplaced;
         pending.reset();
         pending.p=sample;
+        pendingSince=std::chrono::steady_clock::now();
+        ++decodedFrames;
         return retryPending();
     }
     bool drain(){
@@ -174,7 +195,9 @@ struct VideoDecoder::Impl {
                 if(FAILED(hr))return fail("Create decoder buffer",hr);
                 supplied->AddBuffer(b.p);out.pSample=supplied.p;
             }
-            DWORD status=0;hr=decoder->ProcessOutput(0,1,&out,&status);
+            DWORD status=0;auto outputStart=std::chrono::steady_clock::now();
+            hr=decoder->ProcessOutput(0,1,&out,&status);
+            decodeOutputStats.ObserveUs(elapsedUs(outputStart));
             if(out.pEvents)out.pEvents->Release();
             if(hr==MF_E_TRANSFORM_NEED_MORE_INPUT)return true;
             if(hr==MF_E_TRANSFORM_STREAM_CHANGE){if(!outputType())return false;continue;}
@@ -242,11 +265,13 @@ bool VideoDecoder::Decode(const RemoteFrameHeader& frame,const uint8_t* bytes,si
     memcpy(data,bytes,length);buffer->Unlock();buffer->SetCurrentLength((DWORD)length);sample->AddBuffer(buffer.p);
     sample->SetSampleTime((LONGLONG)frame.sequence*166667);sample->SetSampleDuration(166667);sample->SetUINT32(MFSampleExtension_CleanPoint,(frame.flags&1)?TRUE:FALSE);
     if(discontinuity)sample->SetUINT32(MFSampleExtension_Discontinuity,TRUE);
-    hr=v.decoder->ProcessInput(0,sample.p,0);
-    if(hr==MF_E_NOTACCEPTING){if(!v.drain())return false;hr=v.decoder->ProcessInput(0,sample.p,0);}
+    auto processInput=[&]{auto inputStart=std::chrono::steady_clock::now();
+        HRESULT result=v.decoder->ProcessInput(0,sample.p,0);v.decodeInputStats.ObserveUs(Impl::elapsedUs(inputStart));return result;};
+    hr=processInput();
+    if(hr==MF_E_NOTACCEPTING){if(!v.drain())return false;hr=processInput();}
     if(FAILED(hr))return v.fail("H264 GPU decode input",hr);
     v.lastSequence=frame.sequence;v.seenSequence=true;
-    bool ok=v.drain();v.decodeMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();return ok;
+    bool ok=v.drain();auto elapsed=Impl::elapsedUs(start);v.decodeMs=elapsed/1000.0;v.frameProcessStats.ObserveUs(elapsed);return ok;
 }
 bool VideoDecoder::Tick(){
     auto& v=*impl_;
@@ -277,4 +302,14 @@ void VideoDecoder::SetViewport(const RECT& r){impl_->viewport=r;}
 bool VideoDecoder::Hardware()const{return impl_->hardware;}
 double VideoDecoder::LastDecodeMs()const{return impl_->decodeMs;}
 uint64_t VideoDecoder::Presented()const{return impl_->presented;}
+VideoTimingSnapshot VideoDecoder::TimingSnapshot()const{
+    const auto& v=*impl_;VideoTimingSnapshot result;
+    result.decodeInput=v.decodeInputStats.Snapshot();result.decodeOutput=v.decodeOutputStats.Snapshot();
+    result.conversionSubmit=v.conversionStats.Snapshot();result.presentWait=v.presentWaitStats.Snapshot();
+    result.presentCall=v.presentCallStats.Snapshot();result.frameProcess=v.frameProcessStats.Snapshot();
+    result.pendingWait=v.pendingWaitStats.Snapshot();result.presentInterval=v.presentIntervalStats.Snapshot();
+    result.decodedFrames=v.decodedFrames;result.pendingReplaced=v.pendingReplaced;
+    result.presentWaitTimeouts=v.presentWaitTimeouts;result.presentBusy=v.presentBusy;result.presentOccluded=v.presentOccluded;
+    return result;
+}
 const std::string& VideoDecoder::Error()const{return impl_->error;}

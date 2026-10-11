@@ -67,6 +67,8 @@ The [build guide](docs/building.md) covers Windows x64 / ARM64 and Mac Intel / A
 - [Compatibility](docs/compatibility.md) and [Mac signing](docs/development-signing.md)
 - [Transport protocol](docs/transport.md)
 - [System audio, device setup and validation](docs/audio.md)
+- [Latency, graphics APIs and browser FPS assessment](docs/performance-assessment-2026-10-11.md)
+- [Latency scheduling changes and measurement guide](docs/latency-optimization-2026-10-11.md)
 
 ## License
 

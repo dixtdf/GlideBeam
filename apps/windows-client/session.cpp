@@ -1,5 +1,6 @@
 #include "session.h"
 #include "video.h"
+#include "worker-wait.h"
 #include <windows.h>
 #include <wincrypt.h>
 #include <filesystem>
@@ -20,6 +21,9 @@
 #include <climits>
 #include <cctype>
 #include <optional>
+#include <charconv>
+#include <cmath>
+#include <limits>
 namespace {
 std::string TransportErrorText(std::string diagnostic){
     std::transform(diagnostic.begin(),diagnostic.end(),diagnostic.begin(),[](unsigned char c){return (char)std::tolower(c);});
@@ -58,6 +62,66 @@ std::optional<uint32_t> JsonUnsigned(const std::string& json,const std::string& 
     }
     if((leadingZero&&digits>1)||(p<json.size()&&json[p]!=','&&json[p]!='}'&&json[p]!=' '&&json[p]!='\r'&&json[p]!='\n'&&json[p]!='\t'))return {};
     return static_cast<uint32_t>(value);
+}
+std::optional<uint64_t> JsonCounter(const std::string& json,const std::string& key){
+    auto p=json.find('"'+key+'"');if(p==std::string::npos)return {};
+    p=json.find(':',p);if(p==std::string::npos)return {};
+    p=json.find_first_not_of(" \r\n\t",p+1);if(p==std::string::npos||json[p]<'0'||json[p]>'9')return {};
+    uint64_t value=0;bool leadingZero=json[p]=='0';size_t digits=0;
+    for(;p<json.size()&&json[p]>='0'&&json[p]<='9';++p){
+        unsigned digit=static_cast<unsigned>(json[p]-'0');
+        if(value>((std::numeric_limits<uint64_t>::max)()-digit)/10)return {};
+        value=value*10+digit;++digits;
+    }
+    if((leadingZero&&digits>1)||(p<json.size()&&json[p]!=','&&json[p]!='}'&&json[p]!=' '&&json[p]!='\r'&&json[p]!='\n'&&json[p]!='\t'))return {};
+    return value;
+}
+std::optional<double> JsonMilliseconds(const std::string& json,const std::string& key){
+    auto p=json.find('"'+key+'"');if(p==std::string::npos)return {};
+    p=json.find(':',p);if(p==std::string::npos)return {};
+    p=json.find_first_not_of(" \r\n\t",p+1);if(p==std::string::npos||json[p]<'0'||json[p]>'9')return {};
+    const size_t begin=p;
+    if(json[p]=='0')++p;else while(p<json.size()&&json[p]>='0'&&json[p]<='9')++p;
+    if(p<json.size()&&json[p]=='.'){
+        const size_t fraction=++p;while(p<json.size()&&json[p]>='0'&&json[p]<='9')++p;
+        if(p==fraction)return {};
+    }
+    if(p<json.size()&&(json[p]=='e'||json[p]=='E')){
+        ++p;if(p<json.size()&&(json[p]=='+'||json[p]=='-'))++p;
+        const size_t exponent=p;while(p<json.size()&&json[p]>='0'&&json[p]<='9')++p;
+        if(p==exponent)return {};
+    }
+    if(p<json.size()&&json[p]!=','&&json[p]!='}'&&json[p]!=' '&&json[p]!='\r'&&json[p]!='\n'&&json[p]!='\t')return {};
+    double value=0;auto parsed=std::from_chars(json.data()+begin,json.data()+p,value);
+    if(parsed.ec!=std::errc{}||parsed.ptr!=json.data()+p||!std::isfinite(value)||value>600000)return {};
+    return value;
+}
+HostStageTiming ParseHostStage(const std::string& message,const char* prefix){
+    HostStageTiming result;const std::string key=prefix;
+    auto samples=JsonCounter(message,key+"_samples");auto window=JsonUnsigned(message,key+"_window_samples");
+    auto last=JsonMilliseconds(message,key+"_last_ms"),mean=JsonMilliseconds(message,key+"_mean_ms");
+    auto p95=JsonMilliseconds(message,key+"_p95_ms"),p99=JsonMilliseconds(message,key+"_p99_ms"),max=JsonMilliseconds(message,key+"_max_ms");
+    if(!samples||!window||!last||!mean||!p95||!p99||!max||*window>RollingLatencyStats::WindowCapacity||*window>*samples||
+       (*samples==0)!=(*window==0)||*last>*max||*mean>*max+0.001||*p95>*p99||*p99>*max)return result;
+    if(!*window&&(*last!=0||*mean!=0||*p95!=0||*p99!=0||*max!=0))return result;
+    result.samples=*samples;result.windowSamples=*window;result.lastMs=*last;result.meanMs=*mean;
+    result.p95Ms=*p95;result.p99Ms=*p99;result.maxMs=*max;result.available=true;return result;
+}
+void ApplyHostTimingStatus(SessionSnapshot& snapshot,const std::string& message){
+    if(message.size()>16384||JsonString(message,"type")!="host-status")return;
+    // Each report replaces optional measurements. A legacy/partial host must
+    // not retain timings that were reported by an earlier session or capture.
+    HostVideoTimingSnapshot result;
+    auto callbacks=JsonCounter(message,"capture_callbacks"),complete=JsonCounter(message,"capture_complete"),idle=JsonCounter(message,"capture_idle");
+    auto accepted=JsonCounter(message,"video_send_accepted"),rejected=JsonCounter(message,"video_send_rejected");
+    if(callbacks&&complete&&idle&&accepted&&rejected){
+        result.countersAvailable=true;result.captureCallbacks=*callbacks;result.captureComplete=*complete;
+        result.captureIdle=*idle;result.videoSendAccepted=*accepted;result.videoSendRejected=*rejected;
+    }
+    result.captureInterval=ParseHostStage(message,"capture_interval");result.captureCompleteInterval=ParseHostStage(message,"capture_complete_interval");
+    result.mailboxWait=ParseHostStage(message,"mailbox_wait");result.prepack=ParseHostStage(message,"prepack");
+    result.vtSubmit=ParseHostStage(message,"vt_submit");result.encodeCallback=ParseHostStage(message,"encode_callback");
+    result.videoSend=ParseHostStage(message,"video_send");snapshot.hostVideoTiming=result;
 }
 bool ApplyAudioStatus(SessionSnapshot& snapshot,const std::string& message){
     if(JsonString(message,"type")!="audio-status"||JsonUnsigned(message,"version")!=1)return false;
@@ -195,6 +259,7 @@ class ClientSession final:public IClientSession {
         bool changed=false;
         {std::lock_guard lock(stateMutex_);changed=snapshot_.state!=s;snapshot_.state=s;snapshot_.message=message;
          if(s!=SessionState::Connected){snapshot_.macEncoderMode=MacVideoEncoderMode::Unknown;snapshot_.hardwareDecode=false;
+             snapshot_.videoTiming=VideoTimingSnapshot{};snapshot_.hostVideoTiming=HostVideoTimingSnapshot{};
              snapshot_.macAudioState.clear();snapshot_.audio=AudioPlaybackSnapshot{};snapshot_.audio.muted=audioMuted_.load();}}
         if(changed || s==SessionState::Error)remote_log::Write(s==SessionState::Error?remote_log::Level::Error:remote_log::Level::Info,
             "session","state="+std::to_string(static_cast<int>(s))+" error_class="+remote_log::ErrorClass(s==SessionState::Error?message:std::string_view{}));
@@ -242,6 +307,9 @@ class ClientSession final:public IClientSession {
             std::unique_ptr<VideoDecoder> video;
             std::vector<uint8_t> packet(8*1024*1024+4096);
             uint64_t bytes=0,frames=0;
+            RollingLatencyStats receiveIntervals,workerWaits;
+            remote_video_worker::WorkerWait workerWait;
+            std::chrono::steady_clock::time_point lastVideoReceived{};
             auto lastStats=std::chrono::steady_clock::now();
             bool connected=false,awaitIdr=true,captureInactive=false,audioStarted=false;
             std::string captureNotice;
@@ -301,6 +369,7 @@ class ClientSession final:public IClientSession {
                             {
                                 std::lock_guard lock(stateMutex_);
                                 ApplyEncoderStatus(snapshot_,message);
+                                ApplyHostTimingStatus(snapshot_,message);
                                 ApplyRestartCapabilities(snapshot_,message);
                                 if(ApplyRestartStatus(snapshot_,message))remote_log::Write(remote_log::Level::Info,"restart-mac","state="+snapshot_.restartState+" request_id="+snapshot_.restartRequestId);
                             }
@@ -312,7 +381,7 @@ class ClientSession final:public IClientSession {
                                 bool inactive=captureState!="running";
                                 captureNotice=JsonString(message,"capture_message");
                                 if(inactive) {
-                                    if(!captureInactive) { video.reset(); awaitIdr=true; }
+                                    if(!captureInactive) { video.reset(); awaitIdr=true;receiveIntervals.Reset();lastVideoReceived={}; }
                                     if(captureNotice.empty())captureNotice="等待 Mac 恢复画面采集";
                                 } else if(captureInactive) { awaitIdr=true; requestIdr(api,endpoint); }
                                 captureInactive=inactive;
@@ -328,6 +397,10 @@ class ClientSession final:public IClientSession {
                             if((size_t)count<sizeof(RemoteFrameHeader))continue;
                             RemoteFrameHeader header{};memcpy(&header,packet.data(),sizeof(header));
                             if(header.magic!=0x31524652||header.width<64||header.height<64||header.width>7680||header.height>4320||(header.flags&~1u)||header.sequence>(uint64_t)(LLONG_MAX/166667)){state(SessionState::Error,"收到无效视频格式");stop_=true;break;}
+                            auto receivedAt=std::chrono::steady_clock::now();
+                            if(lastVideoReceived!=std::chrono::steady_clock::time_point{})
+                                receiveIntervals.ObserveUs(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(receivedAt-lastVideoReceived).count()));
+                            lastVideoReceived=receivedAt;
                             if(awaitIdr&&!(header.flags&1))continue;
                             if(!video || Snapshot().videoWidth!=header.width || Snapshot().videoHeight!=header.height){
                                 if(!(header.flags&1)){awaitIdr=true;requestIdr(api,endpoint);continue;}
@@ -350,7 +423,9 @@ class ClientSession final:public IClientSession {
                     }
                     auto now=std::chrono::steady_clock::now();double elapsed=std::chrono::duration<double>(now-lastStats).count();
                     if(elapsed>=1.0){
-                        std::lock_guard lock(stateMutex_);snapshot_.fps=frames/elapsed;snapshot_.bitrateMbps=bytes*8.0/elapsed/1000000.0;
+                        VideoTimingSnapshot timings;if(video)timings=video->TimingSnapshot();timings.receiveInterval=receiveIntervals.Snapshot();timings.workerWait=workerWaits.Snapshot();
+                        timings.workerHighResolutionWait=workerWait.HighResolution();timings.workerFallbackWaits=workerWait.FallbackWaits();timings.workerTimerFailures=workerWait.Failures();
+                        std::lock_guard lock(stateMutex_);snapshot_.fps=frames/elapsed;snapshot_.bitrateMbps=bytes*8.0/elapsed/1000000.0;snapshot_.videoTiming=timings;
                         snapshot_.networkMs=api.rtt(endpoint);snapshot_.queuedFrames=api.pending(endpoint,REMOTE_VIDEO);
                         if(audioStarted)snapshot_.audio=audio_.Snapshot();
                         frames=bytes=0;lastStats=now;
@@ -364,7 +439,9 @@ class ClientSession final:public IClientSession {
                         remote_log::Write(remote_log::Level::Warning,"restart-mac","authorization wait timed out");
                     }
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                auto waitStarted=std::chrono::steady_clock::now();
+                workerWait.Wait(stop_);
+                workerWaits.ObserveUs(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-waitStarted).count()));
             }
             inputPump.request_stop();inputReady_.notify_all();if(inputPump.joinable())inputPump.join();
             audio_.Stop();
@@ -508,6 +585,31 @@ bool RunSessionSelfTest(){
     if(TransportErrorText("unexpected socket failure")!="连接已中断，请检查 Mac 端状态后重试")return false;
     if(JsonBool("{\"flag\":\"true\"}","flag")||JsonBool("{\"flag\":truex}","flag")||JsonBool("{\"other\":true}","flag"))return false;
     if(JsonBool("{\"flag\":false}","flag")!=false||JsonBool("{\"flag\": true }","flag")!=true)return false;
+    if(JsonCounter("{\"n\":18446744073709551615}","n")!=(std::numeric_limits<uint64_t>::max)())return false;
+    for(const char* bad:{"18446744073709551616","01","-1","1.0","true","\"12\""})
+        if(JsonCounter(std::string("{\"n\":")+bad+"}","n"))return false;
+    if(JsonMilliseconds("{\"ms\":0.125}","ms")!=0.125||JsonMilliseconds("{\"ms\":1.5e1}","ms")!=15.0)return false;
+    for(const char* bad:{"NaN","Infinity","-1","+1","01.5","1.",".5","1e","1e999","600001","\"1.5\"","true"})
+        if(JsonMilliseconds(std::string("{\"ms\":")+bad+"}","ms"))return false;
+    SessionSnapshot timing;
+    const std::string timingReport="{\"type\":\"host-status\",\"capture_callbacks\":4294967297,\"capture_complete\":11,\"capture_idle\":3,\"video_send_accepted\":9,\"video_send_rejected\":2,"
+        "\"encode_callback_samples\":10,\"encode_callback_window_samples\":10,\"encode_callback_last_ms\":0.125,\"encode_callback_mean_ms\":0.5,"
+        "\"encode_callback_p95_ms\":1.25,\"encode_callback_p99_ms\":2.0,\"encode_callback_max_ms\":2.0}";
+    ApplyHostTimingStatus(timing,timingReport);
+    if(!timing.hostVideoTiming.countersAvailable||timing.hostVideoTiming.captureCallbacks!=4294967297ULL||
+       !timing.hostVideoTiming.encodeCallback.available||timing.hostVideoTiming.encodeCallback.samples!=10||
+       timing.hostVideoTiming.encodeCallback.lastMs!=0.125||timing.hostVideoTiming.encodeCallback.p95Ms!=1.25||
+       timing.hostVideoTiming.prepack.available)return false;
+    ApplyHostTimingStatus(timing,"{\"type\":\"audio-status\"}");
+    if(!timing.hostVideoTiming.encodeCallback.available)return false;
+    ApplyHostTimingStatus(timing,"{\"type\":\"host-status\"}");
+    if(timing.hostVideoTiming.countersAvailable||timing.hostVideoTiming.encodeCallback.available)return false;
+    for(const std::pair<const char*,const char*> bad:{std::pair{"10","257"},std::pair{"10","11"},std::pair{"10","0"}}){
+        const std::string report="{\"type\":\"host-status\",\"encode_callback_samples\":"+std::string(bad.first)+
+            ",\"encode_callback_window_samples\":"+bad.second+",\"encode_callback_last_ms\":0,\"encode_callback_mean_ms\":0,"
+            "\"encode_callback_p95_ms\":0,\"encode_callback_p99_ms\":0,\"encode_callback_max_ms\":0}";
+        ApplyHostTimingStatus(timing,report);if(timing.hostVideoTiming.encodeCallback.available)return false;
+    }
     SessionSnapshot audioStatus;
     if(ApplyAudioStatus(audioStatus,"{\"type\":\"audio-status\",\"version\":true,\"state\":\"running\"}"))return false;
     if(ApplyAudioStatus(audioStatus,"{\"type\":\"audio-status\",\"version\":1.0,\"state\":\"unavailable\"}"))return false;

@@ -181,7 +181,9 @@ jobs:
           codesign --verify --strict 'dist/GlideBeam Host.app'
           'dist/GlideBeam Host.app/Contents/MacOS/RemoteHost' --self-test-localization
       - name: Offline native regression tests
-        run: bash scripts/test-macos-ci.sh
+        env:
+          RUST_TARGET: ${{ matrix.rust-target }}
+        run: bash scripts/test-macos-ci.sh build/ci-tests/macos "target/$RUST_TARGET/release/libremote_transport.a"
       - name: Package public files
         env:
           BUILD_ARCHITECTURE: ${{ matrix.architecture }}

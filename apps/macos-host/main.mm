@@ -13,10 +13,12 @@
 #include "nv12-layout.hpp"
 #include "cursor-image.h"
 #include "capture-recovery.h"
+#include "encoder-wake.h"
 #include "mac-exchange.h"
 #include "restart-mac.h"
 #include "audio-capture.hpp"
 #include "../../shared/diagnostic-log.h"
+#include "../../shared/latency-stats.h"
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -38,6 +40,16 @@
 static uint64_t NowUs() {
     static mach_timebase_info_data_t tb = [] { mach_timebase_info_data_t x; mach_timebase_info(&x); return x; }();
     return (uint64_t)((long double)mach_absolute_time() * tb.numer / tb.denom / 1000.0L);
+}
+static void AppendLatency(NSMutableDictionary *status,NSString *prefix,const RollingLatencyStats& stats) {
+    LatencySnapshot value=stats.Snapshot();
+    status[[prefix stringByAppendingString:@"_samples"]]=@(value.totalSamples);
+    status[[prefix stringByAppendingString:@"_window_samples"]]=@(value.windowSamples);
+    status[[prefix stringByAppendingString:@"_last_ms"]]=@(value.lastUs/1000.0);
+    status[[prefix stringByAppendingString:@"_mean_ms"]]=@(value.meanUs/1000.0);
+    status[[prefix stringByAppendingString:@"_p95_ms"]]=@(value.p95Us/1000.0);
+    status[[prefix stringByAppendingString:@"_p99_ms"]]=@(value.p99Us/1000.0);
+    status[[prefix stringByAppendingString:@"_max_ms"]]=@(value.maxUs/1000.0);
 }
 static void Log(NSString *format, ...) NS_FORMAT_FUNCTION(1,2);
 static void Log(NSString *format, ...) {
@@ -329,13 +341,15 @@ struct FrameMeta {
     CVPixelBufferRef pixel;
     uint64_t captureEpoch;
     uint32_t width, height;
+    uint64_t submittedUs = 0;
     ~FrameMeta() {if(pixel)CVPixelBufferRelease(pixel);}
 };
 // One state per VT session. A callback from a retiring session must never
 // decrement the replacement session's single-inflight gate.
 struct EncoderFlightState : std::enable_shared_from_this<EncoderFlightState> {
-    explicit EncoderFlightState(void *value=nullptr):owner(value) {}
+    explicit EncoderFlightState(void *value=nullptr,EncoderWakeSignal *signal=nullptr):owner(value),wake(signal) {}
     void *owner;
+    EncoderWakeSignal *wake;
     std::atomic<int> inflight{0};
     std::mutex pendingLock;
     std::map<FrameMeta *,std::unique_ptr<FrameMeta>> pending;
@@ -353,12 +367,17 @@ struct EncoderFlightState : std::enable_shared_from_this<EncoderFlightState> {
     }
     void Reject(FrameMeta *key) {
         auto meta=Take(key);
-        if(meta)inflight.fetch_sub(1); // A synchronous callback may already own it.
+        if(meta)Complete(); // A synchronous callback may already own it.
+    }
+    void Complete() {
+        inflight.fetch_sub(1);
+        if(wake)wake->Notify();
     }
     void Retire() {
         std::map<FrameMeta *,std::unique_ptr<FrameMeta>> abandoned;
         { std::lock_guard lock(pendingLock);
           retired=true;abandoned.swap(pending);inflight.fetch_sub((int)abandoned.size()); }
+        if(wake)wake->Notify();
         // Release retained source buffers outside the ownership lock.
     }
 };
@@ -402,9 +421,13 @@ struct QueuedInput { RemoteInputEvent event; std::vector<uint8_t> text; };
     std::atomic<uint64_t> _captured, _encoded, _dropped, _encodedBytes, _encodeFailures;
     std::atomic<int> _connection;
     std::mutex _encoderLock;
+    EncoderWakeSignal _encoderWake;
     std::mutex _captureLock;
     CaptureFrameMailbox _captureFrames;
     std::atomic<uint64_t> _captureEpoch, _frameEpoch;
+    std::atomic<uint64_t> _captureCallbacks, _captureComplete, _captureIdle, _cachedFrameSubmissions, _videoSendAccepted, _videoSendRejected;
+    uint64_t _lastCaptureCallbackUs, _lastCaptureCompleteUs;
+    RollingLatencyStats _captureInterval, _captureCompleteInterval, _mailboxWait, _prepack, _vtSubmit, _encodeCallback, _videoSend;
     std::atomic<void *> _captureSource;
     std::atomic<bool> _captureActive;
     std::atomic<int> _captureFrameState;
@@ -497,12 +520,14 @@ struct QueuedInput { RemoteInputEvent event; std::vector<uint8_t> text; };
 
 static void EncodedCallback(void *context, void *frameContext, OSStatus status,
                             VTEncodeInfoFlags flags, CMSampleBufferRef sample) {
+    uint64_t callbackAt=NowUs();
     auto flight=((EncoderFlightState *)context)->shared_from_this();
     auto meta=flight->Take((FrameMeta *)frameContext);
     if(!meta)return; // Retired/rejected contexts cannot be completed twice.
-    struct CallbackDone {std::shared_ptr<EncoderFlightState> flight;~CallbackDone(){flight->inflight.fetch_sub(1);}} done{flight};
+    struct CallbackDone {std::shared_ptr<EncoderFlightState> flight;~CallbackDone(){flight->Complete();}} done{flight};
     RemoteHost *host = (__bridge RemoteHost *)flight->owner;
     if (meta->captureEpoch != host->_frameEpoch.load() || !host->_captureActive.load()) return;
+    if(meta->submittedUs)host->_encodeCallback.ObserveUs(callbackAt-meta->submittedUs);
     if (status != noErr || !sample) {
         host->_encodeFailures.fetch_add(1);
         Log(@"VT callback status=%d dropped=%d", (int)status, !!(flags & kVTEncodeInfo_FrameDropped));
@@ -521,7 +546,10 @@ static void EncodedCallback(void *context, void *frameContext, OSStatus status,
     if(meta->captureEpoch!=host->_frameEpoch.load() || !host->_captureActive.load() || !host->_captureSource.load()) return;
     host->_consecutiveEncodeFailures.store(0);
     host->_encoded.fetch_add(1); host->_encodedBytes.fetch_add(packet.size());
+    uint64_t sendStart=NowUs();
     int result = remote_send(host->_endpoint, REMOTE_VIDEO, packet.data(), packet.size());
+    host->_videoSend.ObserveUs(NowUs()-sendStart);
+    if(result==1)host->_videoSendAccepted.fetch_add(1);else host->_videoSendRejected.fetch_add(1);
     if (result < 0) host->_forceKeyframe.store(true);
 }
 
@@ -590,6 +618,8 @@ static CGEventFlags ModifierFlag(int key) {
     _postAllowed=CGPreflightPostEventAccess();
     _running.store(true); _forceKeyframe.store(true); _connection.store(0);
     _captured.store(0); _encoded.store(0); _dropped.store(0); _encodedBytes.store(0); _encodeFailures.store(0);
+    _captureCallbacks.store(0); _captureComplete.store(0); _captureIdle.store(0); _cachedFrameSubmissions.store(0);
+    _videoSendAccepted.store(0); _videoSendRejected.store(0); _lastCaptureCallbackUs=_lastCaptureCompleteUs=0;
     _encoder = nullptr; _endpoint = nullptr;
     _captureEpoch.store(1); _frameEpoch.store(1); _captureSource.store(nullptr);
     _captureActive.store(false); _captureFrameState.store(SCFrameStatusStopped);
@@ -720,9 +750,10 @@ static CGEventFlags ModifierFlag(int key) {
                 previous = state;
                 self->_audioRequested.store(false);
                 self->_audioEpoch.fetch_add(1);
+                self->_encoderWake.Notify();
                 dispatch_async(dispatch_get_main_queue(), ^{
                     if (disconnected) [self releaseAll];
-                    if (state == 1) { self->_previousCursor = nil; self->_forceKeyframe.store(true); [self sendStatus:@"Connected"]; }
+                    if (state == 1) { self->_previousCursor = nil; self->_forceKeyframe.store(true); self->_encoderWake.Notify(); [self sendStatus:@"Connected"]; }
                     else if (state < 0) {
                         char error[512] = {}; remote_last_error(self->_endpoint,error,sizeof(error));
                         [self sendStatus:[NSString stringWithFormat:@"Transport error: %s",error]];
@@ -756,39 +787,70 @@ static CGEventFlags ModifierFlag(int key) {
     });
     _encodeThread = std::thread([self] {
         while (self->_running.load()) {
+            // Observe before checking connection/session/mailbox so a producer
+            // changing any dependency before Wait cannot strand pending work.
+            uint64_t observed=self->_encoderWake.Observe();
             if (self->_connection.load() != 1) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue;
+                if(!self->_encoderWake.Wait(observed))break;
+                continue;
             }
             std::unique_lock<std::mutex> encoderLock(self->_encoderLock);
             auto flight=self->_encoderFlight;
-            if (!self->_encoder || !flight || flight->inflight.load()>=1) { encoderLock.unlock(); std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
+            if (!self->_encoder || !flight || flight->inflight.load()>=1 || self->_encoderRecoveryScheduled.load()) {
+                encoderLock.unlock();
+                if(!self->_encoderWake.Wait(observed))break;
+                continue;
+            }
             CVPixelBufferRef frame = nullptr; CMTime pts = kCMTimeInvalid; uint64_t captured = 0;
-            uint64_t epoch = 0;
+            uint64_t epoch = 0, enqueued = 0; bool fresh=false;
             { std::lock_guard captureLock(self->_captureLock);
               epoch = self->_frameEpoch.load();
-              if(self->_captureActive.load() && self->_captureSource.load()) frame = self->_captureFrames.Take(epoch,self->_forceKeyframe.load(),captured); }
+              if(self->_captureActive.load() && self->_captureSource.load()) frame = self->_captureFrames.Take(epoch,self->_forceKeyframe.load(),captured,&enqueued,&fresh); }
             // Static desktops can supply a new IDR, but only from the current,
             // actively shared stream. A paused/stopped stream never supplies it.
-            if(frame) pts=CMTimeMake((int64_t)NowUs(),1000000);
-            if (!frame) { encoderLock.unlock(); std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
+            if(frame) {
+                uint64_t taken=NowUs();pts=CMTimeMake((int64_t)taken,1000000);
+                // Cached static-desktop IDRs can be minutes old; they are not
+                // waiting video frames and must not inflate mailbox latency.
+                if(fresh && enqueued)self->_mailboxWait.ObserveUs(taken-enqueued);
+            }
+            if (!frame) {
+                encoderLock.unlock();
+                if(!self->_encoderWake.Wait(observed))break;
+                continue;
+            }
             if(self->_layoutWorkaround) {
+                uint64_t prepackStart=NowUs();
                 CVPixelBufferRef target=nullptr;
                 CVReturn allocated=CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault,VTCompressionSessionGetPixelBufferPool(self->_encoder),&target);
                 bool packed=allocated==kCVReturnSuccess&&target&&PrepackNV12(frame,target,self->_width,self->_height,self->_codedHeight);
+                self->_prepack.ObserveUs(NowUs()-prepackStart);
                 CVPixelBufferRelease(frame);frame=target;
-                if(!packed){if(frame)CVPixelBufferRelease(frame);self->_encodeFailures.fetch_add(1);self->_forceKeyframe.store(true);Log(@"NV12 layout correction failed allocation=%d",(int)allocated);continue;}
+                if(!packed) {
+                    if(frame)CVPixelBufferRelease(frame);
+                    self->_encodeFailures.fetch_add(1);self->_forceKeyframe.store(true);
+                    Log(@"NV12 layout correction failed allocation=%d",(int)allocated);
+                    encoderLock.unlock();
+                    [self encoderFailed:allocated!=kCVReturnSuccess ? (OSStatus)allocated : paramErr epoch:epoch immediately:YES];
+                    continue;
+                }
             }
             // Keep the input surface alive until its encoder callback finishes.
             // Experimental NVENC does not reliably retain pooled source buffers.
             auto meta = flight->Track(std::unique_ptr<FrameMeta>(new FrameMeta{
                 self->_captured.fetch_add(1)+1, captured, frame, epoch, self->_width, self->_height}));
             if(!meta)continue;
+            if(!fresh)self->_cachedFrameSubmissions.fetch_add(1);
             CFDictionaryRef options = nullptr;
             bool force = self->_forceKeyframe.exchange(false);
             if (force) options = (__bridge CFDictionaryRef)@{(__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame:@YES};
             OSStatus drainStatus = noErr;
+            uint64_t submitStart=NowUs();
+            meta->submittedUs=submitStart;
             OSStatus result = SubmitH264Frame(self->_encoder,self->_encoderMode.load(),frame,pts,
                 CMTimeMake(1,self->_encoderFps),options,meta,&drainStatus);
+            // A synchronous callback may have destroyed meta before return.
+            self->_vtSubmit.ObserveUs(NowUs()-submitStart);
             encoderLock.unlock();
             if (result != noErr) {
                 flight->Reject(meta); self->_encodeFailures.fetch_add(1);
@@ -822,7 +884,7 @@ static CGEventFlags ModifierFlag(int key) {
     _displayStatus = _captureStatus.length ? _captureStatus : RemoteHostLocalizedStatus(message);
     _statusMenu.title = RemoteHostText(_displayStatus);
     if (_endpoint && _connection.load() == 1) {
-        NSDictionary *status = @{ @"type":@"host-status", @"message":message,
+        NSMutableDictionary *status = [@{ @"type":@"host-status", @"message":message,
             @"capture_state":_captureState ?: @"idle", @"capture_message":_captureStatus ?: @"",
             @"cursor":_cursorBaked ? @"video-compatibility" : @"local",
             @"width":@(_width), @"height":@(_height), @"fps":@(_encoderFps),
@@ -831,13 +893,23 @@ static CGEventFlags ModifierFlag(int key) {
             @"captured":@(_captured.load()), @"encoded":@(_encoded.load()),
             @"dropped":@(_dropped.load()), @"encoded_bytes":@(_encodedBytes.load()),
             @"encode_failures":@(_encodeFailures.load()),
+            @"capture_callbacks":@(_captureCallbacks.load()), @"capture_complete":@(_captureComplete.load()),
+            @"capture_idle":@(_captureIdle.load()), @"cached_frame_submissions":@(_cachedFrameSubmissions.load()),
+            @"video_send_accepted":@(_videoSendAccepted.load()), @"video_send_rejected":@(_videoSendRejected.load()),
             @"audio_supported":@YES, @"audio_codec":@"pcm-s16le", @"audio_packet_ms":@5,
             @"audio_state":(!_audioRequested.load() ? @"stopped" : (_audioAttached.load() && _audioCapturing.load() ? @"running" : @"unavailable")),
             @"audio_packets":@(_audioPackets.load()), @"audio_dropped":@(_audioDropped.load()),
             @"audio_max_callback_frames":@(_audioMaxCallbackFrames.load()),
             @"restart_supported":@YES, @"restart_requires_local_authorization":@YES,
             @"restart_busy":@(_restart && _restart->Busy()),
-            @"accessibility":@(CGPreflightPostEventAccess()), @"screen_recording":@(CGPreflightScreenCaptureAccess()) };
+            @"accessibility":@(CGPreflightPostEventAccess()), @"screen_recording":@(CGPreflightScreenCaptureAccess()) } mutableCopy];
+        AppendLatency(status,@"capture_interval",_captureInterval);
+        AppendLatency(status,@"capture_complete_interval",_captureCompleteInterval);
+        AppendLatency(status,@"mailbox_wait",_mailboxWait);
+        AppendLatency(status,@"prepack",_prepack);
+        AppendLatency(status,@"vt_submit",_vtSubmit);
+        AppendLatency(status,@"encode_callback",_encodeCallback);
+        AppendLatency(status,@"video_send",_videoSend);
         NSData *data = [NSJSONSerialization dataWithJSONObject:status options:0 error:nil];
         remote_send(_endpoint,REMOTE_CONTROL,(const uint8_t *)data.bytes,data.length);
     }
@@ -1221,7 +1293,7 @@ static CGEventFlags ModifierFlag(int key) {
             InitializeHardwareVideo();
             std::unique_lock<std::mutex> encoderLock(self->_encoderLock);
             RetireEncoder(self->_encoder,self->_encoderFlight);
-            self->_encoderFlight=std::make_shared<EncoderFlightState>((__bridge void *)self);
+            self->_encoderFlight=std::make_shared<EncoderFlightState>((__bridge void *)self,&self->_encoderWake);
             H264EncoderConfiguration encoder{self->_width,self->_height};
             OSStatus created=CreateStreamingEncoder(encoder,EncodedCallback,self->_encoderFlight.get(),
                 &self->_encoder,self->_forceSoftwareCapture);
@@ -1233,6 +1305,7 @@ static CGEventFlags ModifierFlag(int key) {
                 EncoderModeName(encoder.mode),self->_encoderID,self->_width,self->_height,self->_codedHeight,self->_encoderFps,(int)created);
             if(created!=noErr || !self->_encoder) { encoderLock.unlock(); self->_captureState=@"failed"; self->_captureStatus=@"H.264 硬件及 Apple 软件编码器均不可用，请查看诊断日志并重试画面采集。"; self->_captureBlocked=YES; [self stopCapture]; [self sendStatus:self->_captureStatus]; return; }
             encoderLock.unlock();
+            self->_encoderWake.Notify();
             self->_configuration=[SCStreamConfiguration new];
             self->_configuration.width=self->_width; self->_configuration.height=self->_height;
             self->_configuration.pixelFormat=kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
@@ -1277,7 +1350,7 @@ static CGEventFlags ModifierFlag(int key) {
                     }
                     self->_starting=NO; self->_capturing=YES; self->_captureBlocked=NO;
                     self->_audioCapturing.store(true);
-                    self->_captureRetryAt=0; self->_forceKeyframe.store(true);
+                    self->_captureRetryAt=0; self->_forceKeyframe.store(true); self->_encoderWake.Notify();
                     [self captureFrameStatus:(SCFrameStatus)self->_captureFrameState.load() stream:newStream];
                     [self sendStatus:self->_captureStatus ?: [self encoderStreamingStatus]];
                     if(self->_audioRequested.load())[self sendAudioStatus];
@@ -1291,6 +1364,10 @@ static CGEventFlags ModifierFlag(int key) {
     if(type!=SCStreamOutputTypeScreen || !CMSampleBufferIsValid(sample))return;
     std::lock_guard captureLock(_captureLock);
     if(_captureSource.load()!=(__bridge void *)stream)return;
+    uint64_t callbackAt=NowUs();
+    _captureCallbacks.fetch_add(1);
+    if(_lastCaptureCallbackUs)_captureInterval.ObserveUs(callbackAt-_lastCaptureCallbackUs);
+    _lastCaptureCallbackUs=callbackAt;
     SCFrameStatus status=SCFrameStatusComplete;
     CFArrayRef all=CMSampleBufferGetSampleAttachmentsArray(sample,false);
     if(all && CFArrayGetCount(all)) {
@@ -1299,9 +1376,19 @@ static CGEventFlags ModifierFlag(int key) {
         if(state) status=(SCFrameStatus)state.integerValue;
     }
     int previous=_captureFrameState.exchange(status);
+    if(status==SCFrameStatusIdle)_captureIdle.fetch_add(1);
+    if(status==SCFrameStatusComplete) {
+        _captureComplete.fetch_add(1);
+        if(_lastCaptureCompleteUs)_captureCompleteInterval.ObserveUs(callbackAt-_lastCaptureCompleteUs);
+        _lastCaptureCompleteUs=callbackAt;
+    }
     if(status==SCFrameStatusSuspended || status==SCFrameStatusStopped || status==SCFrameStatusBlank) {
         _captureActive.store(false);
-        if(previous!=status) _captureFrames.Reset(_frameEpoch.fetch_add(1)+1);
+        if(previous!=status) {
+            _captureFrames.Reset(_frameEpoch.fetch_add(1)+1);
+            _lastCaptureCompleteUs=0;
+            _encoderWake.Notify();
+        }
     } else if(status==SCFrameStatusComplete) _captureActive.store(true);
     if(previous!=status) dispatch_async(dispatch_get_main_queue(),^{ [self captureFrameStatus:status stream:stream]; });
     if(status!=SCFrameStatusComplete)return;
@@ -1311,7 +1398,10 @@ static CGEventFlags ModifierFlag(int key) {
     uint64_t capturedUs=std::isfinite(capturedSeconds)&&capturedSeconds>=0 ?
         (uint64_t)llround(capturedSeconds*1000000.0) : NowUs();
     bool replaced=false;
-    if(_captureSource.load()==(__bridge void *)stream && _captureFrames.Publish(epoch,pixel,capturedUs,replaced) && replaced) _dropped.fetch_add(1);
+    if(_captureSource.load()==(__bridge void *)stream && _captureFrames.Publish(epoch,pixel,capturedUs,replaced,NowUs())) {
+        if(replaced)_dropped.fetch_add(1);
+        _encoderWake.Notify();
+    }
 }
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
     dispatch_async(dispatch_get_main_queue(),^{
@@ -1336,7 +1426,13 @@ static CGEventFlags ModifierFlag(int key) {
     unsigned failures=_consecutiveEncodeFailures.fetch_add(1)+1;
     if ((!immediately && failures < 3) || _encoderRecoveryScheduled.exchange(true)) return;
     dispatch_async(dispatch_get_main_queue(), ^{
-        if(epoch!=self->_frameEpoch.load() || !self->_running.load()) { self->_encoderRecoveryScheduled.store(false); return; }
+        if(epoch!=self->_frameEpoch.load() || !self->_running.load()) {
+            self->_encoderRecoveryScheduled.store(false);
+            // A replacement stream may already have published its static
+            // frame while this stale recovery was holding the encode gate.
+            self->_encoderWake.Notify();
+            return;
+        }
         H264EncoderMode mode=self->_encoderMode.load();
         Log(@"Repeated H264 encode failures mode=%@ status=%d",EncoderModeName(mode),(int)status);
         if(mode==H264EncoderMode::Hardware) {
@@ -1362,6 +1458,7 @@ static CGEventFlags ModifierFlag(int key) {
     { std::lock_guard lock(_encoderLock);
       RetireEncoder(_encoder,_encoderFlight);
       _encoderMode.store(H264EncoderMode::Unavailable); _encoderID=@""; }
+    _encoderWake.Notify();
     SCStream *oldStream=_stream; _stream=nil; _configuration=nil;
     _stopping=oldStream!=nil;
     _captureStopDeadline=NowUs()+5000000;
@@ -1382,6 +1479,8 @@ static CGEventFlags ModifierFlag(int key) {
     _captureSource.store(nullptr);
     _captureFrameState.store(SCFrameStatusStopped);
     _captureFrames.Reset(_frameEpoch.fetch_add(1)+1);
+    _lastCaptureCallbackUs=_lastCaptureCompleteUs=0;
+    _encoderWake.Notify();
     return epoch;
 }
 - (void)captureFailed:(NSError *)error stage:(NSString *)stage {
@@ -1415,7 +1514,7 @@ static CGEventFlags ModifierFlag(int key) {
     else if(status==SCFrameStatusBlank) { _captureState=@"blank"; _captureStatus=@"Mac 显示器暂时没有画面，等待屏幕恢复。"; }
     else if(status==SCFrameStatusComplete || (status==SCFrameStatusIdle && _captureActive.load())) {
         _captureState=@"running"; _captureStatus=nil; _captureRetryAttempt=0;
-        if(![before isEqualToString:@"running"]) _forceKeyframe.store(true);
+        if(![before isEqualToString:@"running"]) { _forceKeyframe.store(true); _encoderWake.Notify(); }
     }
     if(![before isEqualToString:_captureState]) {
         if(!_captureActive.load()) [self releaseAll];
@@ -1432,7 +1531,7 @@ static CGEventFlags ModifierFlag(int key) {
             continue;
         }
         // Idempotent control requests are not ordered user input; sequence zero is valid.
-        if(e.type==INPUT_KEYFRAME) { _forceKeyframe.store(true); continue; }
+        if(e.type==INPUT_KEYFRAME) { _forceKeyframe.store(true); _encoderWake.Notify(); continue; }
         if(e.type==INPUT_RELEASE_ALL) {
             // releaseAll also resets sequence tracking on disconnect. Preserve it for
             // a control-only release so stale ordinary input still stays discarded.
@@ -1519,7 +1618,7 @@ static CGEventFlags ModifierFlag(int key) {
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
     [NSNotificationCenter.defaultCenter removeObserver:self];
     if (_showWindowObserver) [NSDistributedNotificationCenter.defaultCenter removeObserver:_showWindowObserver];
-    [self releaseAll]; [_timer invalidate]; [self stopCapture]; _running.store(false);
+    [self releaseAll]; [_timer invalidate]; [self stopCapture]; _running.store(false); _encoderWake.Stop();
     if(_networkThread.joinable())_networkThread.join();
     _restart.reset(); // Cancel any unapproved authorization before closing its transport.
     if(_bulkThread.joinable())_bulkThread.join();

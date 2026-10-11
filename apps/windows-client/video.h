@@ -5,6 +5,17 @@
 #include <memory>
 #include <string>
 #include "../../shared/protocol.h"
+#include "../../shared/latency-stats.h"
+
+// Local CPU wall-clock measurements; GPU completion and scanout are not timed.
+struct VideoTimingSnapshot {
+    LatencySnapshot decodeInput, decodeOutput, conversionSubmit, presentWait, presentCall;
+    LatencySnapshot frameProcess, pendingWait, presentInterval, receiveInterval, workerWait;
+    uint64_t decodedFrames = 0, pendingReplaced = 0, presentWaitTimeouts = 0;
+    uint64_t presentBusy = 0, presentOccluded = 0;
+    bool workerHighResolutionWait = false;
+    uint64_t workerFallbackWaits = 0, workerTimerFailures = 0;
+};
 class VideoDecoder {
 public:
     VideoDecoder();
@@ -18,6 +29,8 @@ public:
     bool Hardware() const;
     double LastDecodeMs() const;
     uint64_t Presented() const;
+    // Call on the COM/video worker, alongside Decode and Tick.
+    VideoTimingSnapshot TimingSnapshot() const;
     const std::string& Error() const;
 private:
     struct Impl;

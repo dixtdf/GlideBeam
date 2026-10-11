@@ -12,6 +12,7 @@
 #include <vector>
 #include <memory>
 #include "audio.h"
+#include "video.h"
 namespace remote_exchange { class Session; }
 
 struct ConnectionOptions {
@@ -24,6 +25,19 @@ enum class SessionState { Idle, Connecting, Connected, Error };
 // Reported by the Mac host. The screen stream encodes on Mac and decodes on
 // Windows; an older host may not report its encoder mode.
 enum class MacVideoEncoderMode { Unknown, Hardware, AppleSoftware, Software };
+struct HostStageTiming {
+    uint64_t samples = 0;
+    uint32_t windowSamples = 0;
+    double lastMs = 0, meanMs = 0, p95Ms = 0, p99Ms = 0, maxMs = 0;
+    bool available = false;
+};
+struct HostVideoTimingSnapshot {
+    bool countersAvailable = false;
+    uint64_t captureCallbacks = 0, captureComplete = 0, captureIdle = 0;
+    uint64_t videoSendAccepted = 0, videoSendRejected = 0;
+    HostStageTiming captureInterval, captureCompleteInterval, mailboxWait;
+    HostStageTiming prepack, vtSubmit, encodeCallback, videoSend;
+};
 struct SessionSnapshot {
     SessionState state = SessionState::Idle;
     std::string message;
@@ -36,6 +50,8 @@ struct SessionSnapshot {
     uint64_t actualFrames = 0;
     MacVideoEncoderMode macEncoderMode = MacVideoEncoderMode::Unknown;
     bool hardwareDecode = false;
+    VideoTimingSnapshot videoTiming;
+    HostVideoTimingSnapshot hostVideoTiming;
     AudioPlaybackSnapshot audio;
     // Empty until a compatible host acknowledges the optional audio protocol.
     std::string macAudioState;

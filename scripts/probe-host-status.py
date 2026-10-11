@@ -119,6 +119,13 @@ try:
                     allowed = ("message", "capture_state", "capture_message", "encoder_mode", "encoder_id", "fps", "width", "height", "coded_height", "nvenc_layout_workaround", "captured", "encoded",
                                "dropped", "encoded_bytes", "encode_failures", "accessibility", "screen_recording", "cursor",
                                "restart_supported", "restart_requires_local_authorization", "restart_busy")
+                    allowed += ("capture_callbacks", "capture_complete", "capture_idle", "cached_frame_submissions",
+                                "video_send_accepted", "video_send_rejected")
+                    allowed += tuple(prefix + suffix
+                                     for prefix in ("capture_interval", "capture_complete_interval", "mailbox_wait",
+                                                    "prepack", "vt_submit", "encode_callback", "video_send")
+                                     for suffix in ("_samples", "_window_samples", "_last_ms", "_mean_ms",
+                                                    "_p95_ms", "_p99_ms", "_max_ms"))
                     public = {key: status[key] for key in allowed if key in status}
                     public["at_seconds"] = round(time.monotonic() - started, 3)
                     report["host_status"].append(public)
