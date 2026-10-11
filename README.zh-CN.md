@@ -69,6 +69,7 @@ Windows x64 与 Intel Mac 已在上述环境进行实际会话验证。**Windows
 - [系统音频、设备配置与验证](docs/audio.md)
 - [低延迟、图形 API 与浏览器帧率评估](docs/performance-assessment-2026-10-11.md)
 - [低延迟调度优化与测量指南](docs/latency-optimization-2026-10-11.md)
+- [FPS 稳定性对照与捕获诊断工具](docs/fps-stability-2026-10-12.md)
 
 ## 许可
 
