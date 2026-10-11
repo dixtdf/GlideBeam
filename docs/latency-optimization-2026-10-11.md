@@ -2,6 +2,8 @@
 
 本轮优先减少光梭自身的等待，并补齐各阶段统计，目标是在持续变化的桌面上尽量稳定交付 60 FPS。修改覆盖 Mac 编码调度和 Windows 视频 worker；目前的结果不能当作稳定 60 FPS 的验收。
 
+后续的捕获频率、队列、像素格式和分辨率对照见 [2026-10-12 FPS 稳定性记录](fps-stability-2026-10-12.md)，其中包含可单独运行的捕获诊断工具。
+
 Mac 保留 NullMoth **1.9.0** 与 RTX 3060 的 H.264 硬件编码。本轮不修改驱动、不关闭浏览器 GPU 沙盒，也不通过调整浏览器配置绕过初始化问题。图形路径继续使用 Mac ScreenCaptureKit / VideoToolbox 和 Windows Media Foundation / D3D11。此前浏览器与图形 API 的定位见[评估记录](performance-assessment-2026-10-11.md)。
 
 ## Mac：用事件唤醒替代编码线程轮询

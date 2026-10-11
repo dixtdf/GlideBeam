@@ -53,7 +53,7 @@ try {
  Invoke-Checked $taskCompiler ($taskCommon + @('-DREMOTE_EXCHANGE_TEST_HOOKS', 'shared/probes/exchange-test.cpp', 'shared/exchange.cpp', 'shared/diagnostic-log.cpp', '-o', $taskEngine, '-lole32', '-lcrypt32'))
  Invoke-Checked $taskEngine @()
  $taskLogger = Join-Path $taskOutput 'diagnostic-log.exe'
- Invoke-Checked $taskCompiler ($taskCommon + @('shared/probes/diagnostic-log-test.cpp', 'shared/diagnostic-log.cpp', '-o', $taskLogger, '-lshell32', '-lole32'))
+Invoke-Checked $taskCompiler ($taskCommon + @('-DREMOTE_LOG_TESTING', 'shared/probes/diagnostic-log-test.cpp', 'shared/diagnostic-log.cpp', '-o', $taskLogger, '-lshell32', '-lole32'))
  Invoke-Checked $taskLogger @((Join-Path $taskOutput ('logger-' + [guid]::NewGuid().ToString('N'))))
  $taskWatchdog = Join-Path $taskOutput 'ui-watchdog.exe'
  Invoke-Checked $taskCompiler ($taskCommon + @('shared/probes/ui-watchdog-test.cpp', 'apps/windows-client/ui-watchdog.cpp', 'shared/diagnostic-log.cpp', '-o', $taskWatchdog, '-lshell32', '-lole32'))

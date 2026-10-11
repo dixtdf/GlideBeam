@@ -4,6 +4,31 @@ cd "$(dirname "$0")/.."
 out="${1:-build/ci-tests/macos}"
 transport_lib="${2:-target/release/libremote_transport.a}"
 mkdir -p "$out"
+# Compile diagnostics without starting desktop capture or opening test windows.
+bash apps/macos-host/probes/probe-build-pattern.sh "$out/capture-pattern" > "$out/capture-pattern-build.txt"
+bash apps/macos-host/probes/probe-build-cadence.sh "$out/capture-cadence" > "$out/capture-cadence-build.txt"
+"$out/capture-cadence" --help > "$out/capture-cadence-help.txt"
+expect_argument_failure() {
+  local executable="$1" expected="$2" result
+  shift 2
+  if "$executable" "$@" > /dev/null 2>&1; then
+    printf 'Diagnostic accepted invalid arguments\n' >&2; exit 1
+  else
+    result=$?
+    if [[ "$result" != "$expected" ]]; then
+      printf 'Diagnostic returned unexpected argument error: %s\n' "$result" >&2; exit 1
+    fi
+  fi
+}
+expect_argument_failure "$out/capture-cadence" 64 --seconds 0
+expect_argument_failure "$out/capture-cadence" 64 --seconds 61
+expect_argument_failure "$out/capture-cadence" 64 --queue-depth 2
+expect_argument_failure "$out/capture-cadence" 64 --fps 61
+expect_argument_failure "$out/capture-cadence" 64 --max-height 721
+expect_argument_failure "$out/capture-cadence" 64 --seconds
+expect_argument_failure "$out/capture-pattern" 2 --pacing unknown
+expect_argument_failure "$out/capture-pattern" 2 --fullscreen false
+printf 'PASS capture diagnostic build and argument validation (no desktop capture)\n'
 xcrun clang++ -std=c++20 -O2 -Wall -Wextra -Werror \
   shared/probes/latency-stats-test.cpp -o "$out/latency-stats"
 "$out/latency-stats" | tee "$out/latency-stats.txt"
@@ -18,7 +43,7 @@ xcrun clang++ -std=c++20 -O2 -Wall -Wextra -Werror \
 "$out/audio-packetizer" | tee "$out/audio-packetizer.txt"
 # No ScreenCaptureKit capture or VideoToolbox hardware requirement on hosted CI.
 # Restart SelfTest injects a mock authorizer and never executes a real reboot.
-xcrun clang++ -std=c++20 -O2 -Wall -Wextra -Werror \
+xcrun clang++ -std=c++20 -O2 -Wall -Wextra -Werror -DREMOTE_LOG_TESTING \
   shared/probes/diagnostic-log-test.cpp shared/diagnostic-log.cpp \
   -o "$out/diagnostic-log"
 "$out/diagnostic-log" "$out/logger-$(uuidgen)" | tee "$out/diagnostic-log.txt"

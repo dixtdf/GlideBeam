@@ -16,6 +16,10 @@ struct Config {
 };
 bool Initialize(Config config = {}) noexcept;
 void Write(Level level, std::string_view component, std::string_view message) noexcept;
+#ifdef REMOTE_LOG_TESTING
+// Test-only admission receipt; true means queued, not yet flushed to disk.
+bool TryWriteForTest(Level level, std::string_view component, std::string_view message) noexcept;
+#endif
 std::filesystem::path Directory();
 // Drain queued metadata at orderly exit. No disk I/O occurs on Write callers.
 void Shutdown() noexcept;

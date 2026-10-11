@@ -69,6 +69,7 @@ The [build guide](docs/building.md) covers Windows x64 / ARM64 and Mac Intel / A
 - [System audio, device setup and validation](docs/audio.md)
 - [Latency, graphics APIs and browser FPS assessment](docs/performance-assessment-2026-10-11.md)
 - [Latency scheduling changes and measurement guide](docs/latency-optimization-2026-10-11.md)
+- [FPS stability experiments and capture diagnostics](docs/fps-stability-2026-10-12.md)
 
 ## License
 
