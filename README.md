@@ -12,14 +12,14 @@ GlideBeam combines a local Windows cursor, independent input transport, Mac H.26
 
 - Native Windows 11 client and macOS host; a full-screen desktop with an automatically hidden top toolbar and movable, window-bounded diagnostics overlay.
 - ScreenCaptureKit capture and VideoToolbox H.264 encoding on Mac, with hardware preference and a software fallback capped at 30 FPS; Media Foundation/D3D11 hardware decoding and GPU presentation on Windows.
-- Mac system audio on Windows (development branch; requires updated endpoints): 5 ms PCM packets, an independent WASAPI worker, adaptive buffering and clock-drift correction, with mute and output-device recovery. The diagnostics overlay reports audio queues, engine period, underruns and loss; see [audio](docs/audio.md).
+- Mac system audio on Windows (0.3.0; requires updated endpoints): 5 ms PCM packets, an independent WASAPI worker, adaptive buffering and clock-drift correction, with mute and output-device recovery. The diagnostics overlay reports audio queues, engine period, underruns and loss; see [audio](docs/audio.md).
 - Pair using an address and one customizable, persistent token. Ten consecutive invalid token proofs block the source IP; the Mac UI can unblock it.
 - Two-way Unicode text and image clipboard sharing; files and folders through copy/paste, drag/drop, or the transfer panel. Progress, pause/resume, cancellation, and SHA-256 verification.
 - Rotating logs on both computers, Mac start at login, and an authenticated Mac restart command with native administrator authorization.
 
 The initial scope is an already logged-in, single-display Mac desktop on a LAN. Microphone forwarding, rich text, directory mirroring, unattended login-screen control, and an Internet relay are not implemented. H.264 is the current video codec; HEVC is not promised.
 
-Audio is available in `0.3.0-dev.audio` development builds. Published `v0.2.1` packages do not include it; [build](docs/building.md) and update both endpoints from this branch.
+Audio is included in [v0.3.0](https://github.com/dixtdf/GlideBeam/releases/tag/v0.3.0). Update both endpoints to use it; older `v0.2.1` packages do not include audio. See the [0.3.0 release notes](docs/releases/0.3.0.md) for changes and validation scope.
 
 ## Get started
 
