@@ -248,14 +248,15 @@ public:
         worker_ = std::thread([this] { Work(); }); running_ = true;
         return true;
     }
-    void Add(Level level, std::string_view component, std::string_view message) {
+    bool Add(Level level, std::string_view component, std::string_view message) {
         std::unique_lock lock(mutex_, std::try_to_lock);
-        if (!lock.owns_lock()) { ++dropped_; return; }
-        if (!running_ || stopping_) return;
-        if (queue_.size() >= config_.maxQueuedRecords) { ++dropped_; return; }
+        if (!lock.owns_lock()) { ++dropped_; return false; }
+        if (!running_ || stopping_) return false;
+        if (queue_.size() >= config_.maxQueuedRecords) { ++dropped_; return false; }
         queue_.push_back({std::chrono::system_clock::now(), std::hash<std::thread::id>{}(std::this_thread::get_id()), level,
             Limited(component, 64), Limited(message, MaxRecordBytes)});
         lock.unlock(); ready_.notify_one();
+        return true;
     }
     std::filesystem::path Path() { std::lock_guard lock(mutex_); return config_.directory.empty() ? DefaultDirectory() : config_.directory; }
     void Stop() noexcept {
@@ -276,6 +277,11 @@ Logger& Instance() { static Logger* logger = new Logger; return *logger; }
 }
 bool Initialize(Config config) noexcept { try { return Instance().Start(std::move(config)); } catch (...) { return false; } }
 void Write(Level level, std::string_view component, std::string_view message) noexcept { try { Instance().Add(level, component, message); } catch (...) {} }
+#ifdef REMOTE_LOG_TESTING
+bool TryWriteForTest(Level level, std::string_view component, std::string_view message) noexcept {
+    try { return Instance().Add(level, component, message); } catch (...) { return false; }
+}
+#endif
 std::filesystem::path Directory() { return Instance().Path(); }
 void Shutdown() noexcept { Instance().Stop(); }
 const char* ErrorClass(std::string_view message) noexcept {

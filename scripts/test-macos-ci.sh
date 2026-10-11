@@ -43,7 +43,7 @@ xcrun clang++ -std=c++20 -O2 -Wall -Wextra -Werror \
 "$out/audio-packetizer" | tee "$out/audio-packetizer.txt"
 # No ScreenCaptureKit capture or VideoToolbox hardware requirement on hosted CI.
 # Restart SelfTest injects a mock authorizer and never executes a real reboot.
-xcrun clang++ -std=c++20 -O2 -Wall -Wextra -Werror \
+xcrun clang++ -std=c++20 -O2 -Wall -Wextra -Werror -DREMOTE_LOG_TESTING \
   shared/probes/diagnostic-log-test.cpp shared/diagnostic-log.cpp \
   -o "$out/diagnostic-log"
 "$out/diagnostic-log" "$out/logger-$(uuidgen)" | tee "$out/diagnostic-log.txt"
