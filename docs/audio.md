@@ -2,7 +2,7 @@
 
 The audio path sends the logged-in Mac's system sound to the paired Windows computer. It does not capture a microphone or forward the Windows microphone. Both endpoints must include the audio implementation; older hosts and viewers retain their existing video/input behavior.
 
-This feature is in the development branch, tested with `0.3.0-dev.audio` builds. Published `v0.2.1` packages do not contain audio. Build and update both endpoints before testing it.
+System audio and playback diagnostics are included in `v0.3.0`; historical `v0.2.1` packages do not contain audio. Update both endpoints before testing these features.
 
 ## Capture and packets
 
