@@ -48,6 +48,25 @@ std::optional<bool> JsonBool(const std::string& json,const std::string& key){
     size_t end=p+length;if(end<json.size()&&json[end]!=','&&json[end]!='}'&&json[end]!=' '&&json[end]!='\r'&&json[end]!='\n'&&json[end]!='\t')return {};
     return value;
 }
+std::optional<uint32_t> JsonUnsigned(const std::string& json,const std::string& key){
+    auto p=json.find('"'+key+'"');if(p==std::string::npos)return {};
+    p=json.find(':',p);if(p==std::string::npos)return {};
+    p=json.find_first_not_of(" \r\n\t",p+1);if(p==std::string::npos||json[p]<'0'||json[p]>'9')return {};
+    uint64_t value=0;bool leadingZero=json[p]=='0';size_t digits=0;
+    for(;p<json.size()&&json[p]>='0'&&json[p]<='9';++p){
+        value=value*10+static_cast<unsigned>(json[p]-'0');if(value>UINT32_MAX)return {};++digits;
+    }
+    if((leadingZero&&digits>1)||(p<json.size()&&json[p]!=','&&json[p]!='}'&&json[p]!=' '&&json[p]!='\r'&&json[p]!='\n'&&json[p]!='\t'))return {};
+    return static_cast<uint32_t>(value);
+}
+bool ApplyAudioStatus(SessionSnapshot& snapshot,const std::string& message){
+    if(JsonString(message,"type")!="audio-status"||JsonUnsigned(message,"version")!=1)return false;
+    const auto state=JsonString(message,"state");
+    if(state!="running"&&state!="unavailable"&&state!="stopped")return false;
+    if(state=="running"&&(JsonString(message,"codec")!="pcm-s16le"||JsonUnsigned(message,"sample_rate")!=48000||
+        JsonUnsigned(message,"channels")!=2||JsonUnsigned(message,"packet_ms")!=5))return false;
+    snapshot.macAudioState=state;return true;
+}
 bool ValidRequestId(const std::string& id){
     if(id.size()!=36)return false;
     for(size_t n=0;n<id.size();++n){if(n==8||n==13||n==18||n==23){if(id[n]!='-')return false;}else if(!std::isxdigit(static_cast<unsigned char>(id[n])))return false;}
@@ -122,6 +141,7 @@ struct Api {
     decltype(&remote_bulk_status) bulkStatus=nullptr;
     decltype(&remote_bulk_send) bulkSend=nullptr;
     decltype(&remote_bulk_poll) bulkPoll=nullptr;
+    decltype(&remote_audio_poll) audioPoll=nullptr;
     ~Api(){if(module)FreeLibrary(module);}
     bool load(){
         wchar_t exe[32768]{};GetModuleFileNameW(nullptr,exe,32768);
@@ -132,6 +152,9 @@ struct Api {
         LOAD(start,"remote_client_start");LOAD(status,"remote_status");LOAD(rtt,"remote_rtt_ms");LOAD(pending,"remote_pending");
         LOAD(send,"remote_send");LOAD(poll,"remote_poll");LOAD(error,"remote_last_error");LOAD(fingerprint,"remote_fingerprint");LOAD(close,"remote_close");
         LOAD(bulkStatus,"remote_bulk_status");LOAD(bulkSend,"remote_bulk_send");LOAD(bulkPoll,"remote_bulk_poll");
+        // Optional so replacing only the client executable preserves video
+        // operation with an older transport DLL; packaged builds include both.
+        {auto symbol=GetProcAddress(module,"remote_audio_poll");static_assert(sizeof(symbol)==sizeof(audioPoll));memcpy(&audioPoll,&symbol,sizeof(audioPoll));}
 #undef LOAD
         return true;
     }
@@ -164,12 +187,15 @@ class ClientSession final:public IClientSession {
     std::atomic<bool> stop_{false};
     std::atomic<bool> workerDone_{true};
     std::thread worker_;
+    AudioPlayer audio_;
+    std::atomic<bool> audioMuted_{false};
     std::shared_ptr<BulkState> bulkState_=std::make_shared<BulkState>();
     std::shared_ptr<remote_exchange::Session> exchange_;
     void state(SessionState s,const std::string& message){
         bool changed=false;
         {std::lock_guard lock(stateMutex_);changed=snapshot_.state!=s;snapshot_.state=s;snapshot_.message=message;
-         if(s!=SessionState::Connected){snapshot_.macEncoderMode=MacVideoEncoderMode::Unknown;snapshot_.hardwareDecode=false;}}
+         if(s!=SessionState::Connected){snapshot_.macEncoderMode=MacVideoEncoderMode::Unknown;snapshot_.hardwareDecode=false;
+             snapshot_.macAudioState.clear();snapshot_.audio=AudioPlaybackSnapshot{};snapshot_.audio.muted=audioMuted_.load();}}
         if(changed || s==SessionState::Error)remote_log::Write(s==SessionState::Error?remote_log::Level::Error:remote_log::Level::Info,
             "session","state="+std::to_string(static_cast<int>(s))+" error_class="+remote_log::ErrorClass(s==SessionState::Error?message:std::string_view{}));
     }
@@ -183,6 +209,7 @@ class ClientSession final:public IClientSession {
             if(!endpoint){state(SessionState::Error,"连接配置无效");return;}
             remote_log::Write(remote_log::Level::Info,"transport","endpoint created");
             std::unique_ptr<remote_endpoint,decltype(api.close)> endpointOwner(endpoint,api.close);
+            struct AudioCleanup {AudioPlayer& player;~AudioCleanup(){player.Stop();}} audioCleanup{audio_};
             {std::lock_guard guard(bulkState_->mutex);bulkState_->endpoint=endpoint;bulkState_->send=api.bulkSend;}
             struct BulkCleanup {std::shared_ptr<remote_exchange::Session> exchange;std::shared_ptr<BulkState> state;~BulkCleanup(){exchange->SetConnected(false);state->Reset();}} bulkCleanup{exchange_,bulkState_};
             std::jthread bulkPump([this,&api,endpoint](std::stop_token token){
@@ -216,7 +243,7 @@ class ClientSession final:public IClientSession {
             std::vector<uint8_t> packet(8*1024*1024+4096);
             uint64_t bytes=0,frames=0;
             auto lastStats=std::chrono::steady_clock::now();
-            bool connected=false,awaitIdr=true,captureInactive=false;
+            bool connected=false,awaitIdr=true,captureInactive=false,audioStarted=false;
             std::string captureNotice;
             while(!stop_){
                 int status=api.status(endpoint);
@@ -226,6 +253,11 @@ class ClientSession final:public IClientSession {
                     std::array<char,128> fingerprint{};if(api.fingerprint(endpoint,fingerprint.data(),fingerprint.size())>0)options.fingerprint=fingerprint.data();
                     if(options.persistSettings)SaveConnectionOptions(options);
                     requestIdr(api,endpoint);
+                    if(api.audioPoll){
+                        const std::string request="{\"type\":\"audio-start\",\"version\":1}";
+                        if(api.send(endpoint,REMOTE_CONTROL,reinterpret_cast<const uint8_t*>(request.data()),request.size())<0)
+                            remote_log::Write(remote_log::Level::Warning,"audio","negotiation request not accepted");
+                    }
                     inputPump=std::jthread([this,&api,endpoint](std::stop_token token){
                         while(!stop_&&!token.stop_requested()){
                             std::deque<std::vector<uint8_t>> pending;
@@ -253,6 +285,19 @@ class ClientSession final:public IClientSession {
                         if(channel==REMOTE_CURSOR){std::lock_guard lock(stateMutex_);cursor_.assign(packet.begin(),packet.begin()+count);}
                         else if(channel==REMOTE_CONTROL){
                             std::string message((char*)packet.data(),count);
+                            if(JsonString(message,"type")=="audio-status"){
+                                bool valid=false;std::string audioState;
+                                {std::lock_guard lock(stateMutex_);valid=ApplyAudioStatus(snapshot_,message);audioState=snapshot_.macAudioState;}
+                                if(valid&&audioState=="running"&&api.audioPoll&&!audioStarted){
+                                    audio_.SetMuted(audioMuted_.load());
+                                    audioStarted=audio_.Start([&api,endpoint](uint8_t* data,size_t size){return api.audioPoll(endpoint,data,size);});
+                                    if(!audioStarted)remote_log::Write(remote_log::Level::Warning,"audio","playback worker could not start");
+                                }else if(valid&&audioState!="running"){
+                                    if(audioStarted){audio_.Stop();audioStarted=false;}
+                                    std::lock_guard lock(stateMutex_);snapshot_.audio=AudioPlaybackSnapshot{};snapshot_.audio.muted=audioMuted_.load();
+                                }
+                                continue;
+                            }
                             {
                                 std::lock_guard lock(stateMutex_);
                                 ApplyEncoderStatus(snapshot_,message);
@@ -307,6 +352,7 @@ class ClientSession final:public IClientSession {
                     if(elapsed>=1.0){
                         std::lock_guard lock(stateMutex_);snapshot_.fps=frames/elapsed;snapshot_.bitrateMbps=bytes*8.0/elapsed/1000000.0;
                         snapshot_.networkMs=api.rtt(endpoint);snapshot_.queuedFrames=api.pending(endpoint,REMOTE_VIDEO);
+                        if(audioStarted)snapshot_.audio=audio_.Snapshot();
                         frames=bytes=0;lastStats=now;
                     }
                 }
@@ -321,6 +367,7 @@ class ClientSession final:public IClientSession {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
             inputPump.request_stop();inputReady_.notify_all();if(inputPump.joinable())inputPump.join();
+            audio_.Stop();
             bulkPump.request_stop();if(bulkPump.joinable())bulkPump.join();
             if(connected){RemoteInputEvent release{};release.type=INPUT_RELEASE_ALL;api.send(endpoint,REMOTE_INPUT,(const uint8_t*)&release,sizeof(release));std::this_thread::sleep_for(std::chrono::milliseconds(15));}
             video.reset();exchange_->SetConnected(false);
@@ -333,6 +380,10 @@ public:
     ClientSession(){wchar_t profile[32768]{};DWORD n=GetEnvironmentVariableW(L"USERPROFILE",profile,32768);auto directory=n&&n<32768?std::filesystem::path(profile)/L"Downloads"/L"Remote Native":std::filesystem::temp_directory_path()/L"Remote Native";exchange_=std::make_shared<remote_exchange::Session>(false,directory,[state=bulkState_](const uint8_t* bytes,size_t size){return state->Send(bytes,size);});}
     ~ClientSession(){Disconnect();exchange_.reset();}
     std::shared_ptr<remote_exchange::Session> Exchange()const override{return exchange_;}
+    void SetAudioMuted(bool muted)override{
+        audioMuted_.store(muted);audio_.SetMuted(muted);
+        std::lock_guard lock(stateMutex_);snapshot_.audio.muted=muted;
+    }
     bool RestartMac()override{
         GUID id{};if(FAILED(CoCreateGuid(&id)))return false;
         char requestId[37]{};
@@ -354,7 +405,7 @@ public:
         remote_log::Write(remote_log::Level::Info,"session","connect requested");
         if(options.address.empty()||!ValidToken(options.token)){state(SessionState::Error,"请填写地址和 6–128 个字符的配对令牌");return false;}
         canvas_=canvas;stop_=false;
-        {std::lock_guard lock(stateMutex_);snapshot_=SessionSnapshot{};snapshot_.state=SessionState::Connecting;snapshot_.message="正在验证加密连接";snapshot_.networkMs=-1;}
+        {std::lock_guard lock(stateMutex_);snapshot_=SessionSnapshot{};snapshot_.state=SessionState::Connecting;snapshot_.message="正在验证加密连接";snapshot_.networkMs=-1;snapshot_.audio.muted=audioMuted_.load();}
         workerDone_=false;
         worker_=std::thread([this,options]{try{run(options);}catch(const std::exception& e){state(SessionState::Error,e.what());}catch(...){state(SessionState::Error,"会话遇到异常");}workerDone_=true;});return true;
     }
@@ -370,7 +421,7 @@ public:
         }
         bulkState_->Reset();
         {std::lock_guard lock(inputMutex_);input_.clear();control_.clear();}
-        {std::lock_guard lock(stateMutex_);snapshot_=SessionSnapshot{};snapshot_.message="准备连接你的 Mac";cursor_.clear();}
+        {std::lock_guard lock(stateMutex_);snapshot_=SessionSnapshot{};snapshot_.message="准备连接你的 Mac";snapshot_.audio.muted=audioMuted_.load();cursor_.clear();}
         if(hadWorker)remote_log::Write(remote_log::Level::Info,"session","disconnect complete");
     }
     void SendInput(const uint8_t* bytes,size_t size)override{
@@ -457,6 +508,12 @@ bool RunSessionSelfTest(){
     if(TransportErrorText("unexpected socket failure")!="连接已中断，请检查 Mac 端状态后重试")return false;
     if(JsonBool("{\"flag\":\"true\"}","flag")||JsonBool("{\"flag\":truex}","flag")||JsonBool("{\"other\":true}","flag"))return false;
     if(JsonBool("{\"flag\":false}","flag")!=false||JsonBool("{\"flag\": true }","flag")!=true)return false;
+    SessionSnapshot audioStatus;
+    if(ApplyAudioStatus(audioStatus,"{\"type\":\"audio-status\",\"version\":true,\"state\":\"running\"}"))return false;
+    if(ApplyAudioStatus(audioStatus,"{\"type\":\"audio-status\",\"version\":1.0,\"state\":\"unavailable\"}"))return false;
+    if(ApplyAudioStatus(audioStatus,"{\"type\":\"audio-status\",\"version\":1,\"state\":\"running\",\"codec\":\"unknown\"}"))return false;
+    if(!ApplyAudioStatus(audioStatus,"{\"type\":\"audio-status\",\"version\":1,\"state\":\"running\",\"codec\":\"pcm-s16le\",\"sample_rate\":48000,\"channels\":2,\"packet_ms\":5}")||audioStatus.macAudioState!="running")return false;
+    if(!ApplyAudioStatus(audioStatus,"{\"type\":\"audio-status\",\"version\":1,\"state\":\"unavailable\"}")||audioStatus.macAudioState!="unavailable")return false;
     SessionSnapshot encoder;
     auto encoderMessage=[&](bool hardwareDecode){return std::string(VideoPathMessage(encoder.macEncoderMode,hardwareDecode));};
     if(encoderMessage(false)!="H.264 编码 · 等待 Windows GPU 硬解"||

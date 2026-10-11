@@ -12,6 +12,17 @@ std::atomic<SystemLanguageResolver> systemResolver{nullptr};
 struct Entry { const char* zh; const char* en; const wchar_t* wideZh; const wchar_t* wideEn; };
 #define ENTRY(ZH, EN) {ZH, EN, L##ZH, L##EN}
 const Entry catalog[] = {
+    ENTRY("等待系统声音", "Waiting for system audio"),
+    ENTRY("音频不可用", "Audio unavailable"),
+    ENTRY("已静音", "Muted"),
+    ENTRY("PCM · 48 kHz · 双声道", "PCM · 48 kHz · Stereo"),
+    ENTRY("系统声音", "System audio"),
+    ENTRY("音频缓冲 / 目标", "Audio buffer / target"),
+    ENTRY("声卡排队 / 周期", "Device queue / period"),
+    ENTRY("音频欠载 / 丢包", "Audio underruns / loss"),
+    ENTRY("声卡耗尽事件", "Device depletion events"),
+    ENTRY("静音系统声音", "Mute system audio"),
+    ENTRY("恢复系统声音", "Unmute system audio"),
     ENTRY("连接", "Connect"),
     ENTRY("偏好设置", "Preferences"),
     ENTRY("让每一次操作，都更跟手。", "Every move feels immediate."),

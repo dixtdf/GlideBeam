@@ -12,11 +12,14 @@
 
 - Windows 11 原生客户端和 macOS 主机端；真正全屏、顶部自动隐藏工具栏、可拖动且限制在窗口内的状态浮窗。
 - Mac 使用 ScreenCaptureKit 采集、VideoToolbox H.264 编码；优先硬件，不可用时软件回退并限制到 30 FPS。Windows 使用 Media Foundation / D3D11 硬件解码和 GPU 呈现。
+- Mac 系统声音传到 Windows（开发分支，需更新双端）：5 ms PCM 音频包、独立 WASAPI 播放线程、自适应缓冲与时钟漂移补偿；支持静音及输出设备恢复。传输信息显示音频缓冲、声卡周期、欠载和丢包，详见[音频说明](docs/audio.md)。
 - 地址加一个可自定义、持久保存的配对令牌。同一 IP 连续 10 次完整错误令牌验证后封禁，Mac 界面可解除封禁。
 - 双向 Unicode 文本和图片剪贴板；复制粘贴、拖拽和文件面板传输文件及文件夹。支持进度、暂停、继续、取消与 SHA-256 校验。
 - 双端轮转日志、Mac 登录后自启，以及经过配对鉴权和系统管理员授权的 Mac 重启功能。
 
-当前覆盖已登录的单屏 Mac 桌面与局域网。尚未实现音频、富文本、目录镜像、登录前控制或公网中继。视频使用 H.264，不承诺 HEVC 支持。
+当前覆盖已登录的单屏 Mac 桌面与局域网。尚未实现麦克风转发、富文本、目录镜像、登录前控制或公网中继。视频使用 H.264，不承诺 HEVC 支持。
+
+音频目前在 `0.3.0-dev.audio` 开发测试版中可用。已发布的 `v0.2.1` 不含音频，需要从当前分支[构建](docs/building.md)并更新双端。
 
 ## 开始使用
 
@@ -63,6 +66,7 @@ Windows x64 与 Intel Mac 已在上述环境进行实际会话验证。**Windows
 - [构建](docs/building.md)、[发布自动化](docs/release.md)
 - [兼容性](docs/compatibility.md)、[Mac 签名](docs/development-signing.md)
 - [传输协议](docs/transport.md)
+- [系统音频、设备配置与验证](docs/audio.md)
 
 ## 许可
 

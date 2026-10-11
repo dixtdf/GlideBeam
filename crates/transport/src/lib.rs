@@ -1,4 +1,5 @@
 //! Encrypted, password-authenticated, bounded LAN transport behind the stable C ABI.
+mod audio;
 mod auth;
 mod tls;
 mod video;
@@ -129,6 +130,11 @@ struct Shared {
     bulk_send_notify: Notify,
     bulk_receive_space: Notify,
     bulk_connection: Mutex<Option<quinn::Connection>>,
+    audio_active: AtomicBool,
+    audio_send_enabled: AtomicBool,
+    audio_incoming: Mutex<audio::Queue>,
+    audio_outgoing: Mutex<audio::Queue>,
+    audio_send_notify: Notify,
 }
 impl Shared {
     fn new() -> Self {
@@ -153,6 +159,11 @@ impl Shared {
             bulk_send_notify: Notify::new(),
             bulk_receive_space: Notify::new(),
             bulk_connection: Mutex::new(None),
+            audio_active: AtomicBool::new(false),
+            audio_send_enabled: AtomicBool::new(false),
+            audio_incoming: Mutex::new(audio::Queue::default()),
+            audio_outgoing: Mutex::new(audio::Queue::default()),
+            audio_send_notify: Notify::new(),
         }
     }
     fn error(&self, message: impl Into<String>) {
@@ -184,6 +195,9 @@ impl Shared {
         self.local_keyframe_pending.store(true, Ordering::Release);
     }
     async fn inbound_reliable(&self, mut message: Message) {
+        if message.channel == 1 {
+            self.audio_control(&message.data);
+        }
         loop {
             let notified = self.receive_space.notified();
             match self.incoming.lock().unwrap().push(message) {
@@ -210,6 +224,7 @@ impl Shared {
         self.sender_wait_idr.store(false, Ordering::Release);
         self.local_keyframe_pending.store(false, Ordering::Release);
         self.clear_bulk();
+        self.clear_audio();
     }
     fn clear_bulk(&self) {
         // Serialize against FFI sends: no accepted old-session message survives reconnect.
@@ -221,6 +236,44 @@ impl Shared {
             connection.close(0u32.into(), b"bulk session closed");
         }
         self.bulk_receive_space.notify_one();
+    }
+    fn clear_audio(&self) {
+        // Serialize the session boundary with FFI sends before removing old sound.
+        let mut outgoing = self.audio_outgoing.lock().unwrap();
+        self.audio_active.store(false, Ordering::Release);
+        self.audio_send_enabled.store(false, Ordering::Release);
+        *outgoing = audio::Queue::default();
+        *self.audio_incoming.lock().unwrap() = audio::Queue::default();
+    }
+    fn begin_audio_session(&self) {
+        // Reset even if the native status poll missed a rapid reconnect.
+        let mut outgoing = self.audio_outgoing.lock().unwrap();
+        self.audio_send_enabled.store(false, Ordering::Release);
+        *outgoing = audio::Queue::default();
+        *self.audio_incoming.lock().unwrap() = audio::Queue::default();
+        self.audio_active.store(true, Ordering::Release);
+    }
+    fn audio_control(&self, data: &[u8]) {
+        let Ok(message) = serde_json::from_slice::<serde_json::Value>(data) else {
+            return;
+        };
+        if message.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+            return;
+        }
+        let enabled = match message.get("type").and_then(serde_json::Value::as_str) {
+            Some("audio-start") => true,
+            Some("audio-stop") => false,
+            _ => return,
+        };
+        let mut outgoing = self.audio_outgoing.lock().unwrap();
+        if !self.audio_active.load(Ordering::Acquire) {
+            return;
+        }
+        self.audio_send_enabled.store(enabled, Ordering::Release);
+        if !enabled {
+            *outgoing = audio::Queue::default();
+        }
+        self.audio_send_notify.notify_one();
     }
 }
 pub struct Handle {
@@ -253,15 +306,43 @@ fn start(mode: Mode, token: String) -> Result<*mut Handle, String> {
     }
     let state = shared.clone();
     let (stop, mut stop_rx) = watch::channel(false);
-    let worker = thread::Builder::new().name("remote-transport".into()).spawn(move || {
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().map_err(|e| e.to_string())?;
-            runtime.block_on(async {
-                tokio::select! { result = run(mode, token, state.clone()) => result, _ = stop_rx.changed() => Ok(()) }
+    let worker = thread::Builder::new()
+        .name("remote-transport".into())
+        .spawn(move || {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                runtime.block_on(async {
+                tokio::select! {
+                    result = run(mode, token, state.clone()) => result,
+                    _ = stop_rx.changed() => {
+                        // Send an explicit QUIC close while the runtime still
+                        // drives UDP. Dropping the runtime immediately can leave
+                        // the peer waiting for its idle timeout on macOS.
+                        for connection in state.active_connections.lock().unwrap().iter() {
+                            connection.close(0u32.into(), b"endpoint closed");
+                        }
+                        if let Some(connection) = state.bulk_connection.lock().unwrap().as_ref() {
+                            connection.close(0u32.into(), b"endpoint closed");
+                        }
+                        state.clear_audio();
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        Ok(())
+                    }
+                }
             })
-        }));
-        match result { Ok(Err(error)) => state.fail(error), Err(_) => state.fail("transport worker panicked"), _ => {} }
-    }).map_err(|e| format!("start transport thread: {e}"))?;
+            }));
+            match result {
+                Ok(Err(error)) => state.fail(error),
+                Err(_) => state.fail("transport worker panicked"),
+                _ => {}
+            }
+            state.clear_audio();
+        })
+        .map_err(|e| format!("start transport thread: {e}"))?;
     Ok(Box::into_raw(Box::new(Handle {
         shared,
         stop,
@@ -445,6 +526,7 @@ async fn run(mode: Mode, token: String, state: Arc<Shared>) -> Result<(), String
                 &fingerprint,
             )?))?);
             let media = connect_media(&endpoint, server, ticket, session_id).await?;
+            *state.active_connections.lock().unwrap() = vec![input.clone(), media.clone()];
             let bulk = BulkMode::Client {
                 endpoint,
                 server,
@@ -951,13 +1033,14 @@ async fn session(
     state: Arc<Shared>,
     bulk_mode: Option<BulkMode>,
 ) -> Result<(), String> {
+    state.begin_audio_session();
     let mut tasks = tokio::task::JoinSet::new();
     for channel in 1..=3 {
         tasks.spawn(reliable_sender(input.clone(), state.clone(), channel));
     }
     tasks.spawn(reliable_receiver(input.clone(), state.clone()));
-    tasks.spawn(video_sender(media.clone(), state.clone()));
-    tasks.spawn(video_receiver(media.clone(), state.clone()));
+    tasks.spawn(media_sender(media.clone(), state.clone()));
+    tasks.spawn(media_receiver(media.clone(), state.clone()));
     let measured_connection = input.clone();
     let measured_state = state.clone();
     tasks.spawn(async move {
@@ -985,6 +1068,7 @@ async fn session(
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     state.clear_bulk();
+    state.clear_audio();
     result
 }
 async fn reliable_sender(
@@ -1041,12 +1125,85 @@ async fn reliable_receiver(
         }
     }
 }
-async fn video_sender(connection: quinn::Connection, state: Arc<Shared>) -> Result<(), String> {
+async fn send_audio_packet(
+    connection: &quinn::Connection,
+    state: &Shared,
+    packet: audio::Packet,
+) -> bool {
+    let data = Bytes::from(packet.data);
+    loop {
+        let notified = state.audio_send_notify.notified();
+        let remaining = audio::MAX_AGE.saturating_sub(packet.queued.elapsed());
+        if remaining.is_zero() || !state.audio_send_enabled.load(Ordering::Acquire) {
+            return false;
+        }
+        tokio::select! {
+            biased;
+            _ = notified => {},
+            result = tokio::time::timeout(remaining, connection.send_datagram_wait(data.clone())) => {
+                return matches!(result, Ok(Ok(())));
+            },
+        }
+    }
+}
+
+async fn drain_audio(connection: &quinn::Connection, state: &Shared) {
+    // A producer cannot monopolize the scheduler: at most four blocks before
+    // the next video fragment. Older sound is discarded rather than retried.
+    for _ in 0..4 {
+        let packet = {
+            let mut outgoing = state.audio_outgoing.lock().unwrap();
+            if state.audio_send_enabled.load(Ordering::Acquire) {
+                outgoing.pop(Instant::now())
+            } else {
+                None
+            }
+        };
+        let Some(packet) = packet else {
+            break;
+        };
+        if !send_audio_packet(connection, state, packet).await {
+            state.audio_outgoing.lock().unwrap().mark_discontinuity();
+        }
+    }
+}
+
+async fn send_video_fragment(
+    connection: &quinn::Connection,
+    state: &Shared,
+    packet: Bytes,
+) -> Result<(), String> {
+    loop {
+        let audio_ready = state.audio_send_notify.notified();
+        drain_audio(connection, state).await;
+        // While a video fragment waits for congestion relief, new sound can
+        // interrupt that wait. The unsent video fragment is retained, and no
+        // accepted datagram is silently evicted from Quinn's send buffer.
+        tokio::select! {
+            biased;
+            _ = audio_ready => {},
+            result = connection.send_datagram_wait(packet.clone()) => {
+                return result.map_err(|e| e.to_string());
+            },
+        }
+    }
+}
+
+async fn media_sender(connection: quinn::Connection, state: Arc<Shared>) -> Result<(), String> {
     loop {
         let notified = state.send_notify[3].notified();
+        let audio_ready = state.audio_send_notify.notified();
+        drain_audio(&connection, &state).await;
         let message = state.outgoing[3].lock().unwrap().pop();
         let Some(message) = message else {
-            notified.await;
+            // Inner send waits can consume a notification while this bounded
+            // drain leaves a source burst pending. Do not wait for the next
+            // callback and expire the remaining sound on a static desktop.
+            if state.audio_outgoing.lock().unwrap().len(Instant::now()) > 0 {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            tokio::select! { _ = notified => {}, _ = audio_ready => {} }
             continue;
         };
         if state.sender_wait_idr.load(Ordering::Acquire) && !is_idr(&message.data) {
@@ -1058,10 +1215,7 @@ async fn video_sender(connection: quinn::Connection, state: Arc<Shared>) -> Resu
         let packets = video::fragment(&message.data, video_sequence(&message.data), mtu)?;
         let result = tokio::time::timeout(Duration::from_millis(100), async {
             for packet in packets {
-                connection
-                    .send_datagram_wait(Bytes::from(packet))
-                    .await
-                    .map_err(|e| e.to_string())?;
+                send_video_fragment(&connection, &state, Bytes::from(packet)).await?;
             }
             Ok::<(), String>(())
         })
@@ -1072,7 +1226,7 @@ async fn video_sender(connection: quinn::Connection, state: Arc<Shared>) -> Resu
         }
     }
 }
-async fn video_receiver(connection: quinn::Connection, state: Arc<Shared>) -> Result<(), String> {
+async fn media_receiver(connection: quinn::Connection, state: Arc<Shared>) -> Result<(), String> {
     let mut assembly = video::Reassembler::new();
     let mut pending: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     let mut wait_idr = true;
@@ -1083,6 +1237,16 @@ async fn video_receiver(connection: quinn::Connection, state: Arc<Shared>) -> Re
         tokio::select! {
             datagram = connection.read_datagram() => {
                 let datagram = datagram.map_err(|e| e.to_string())?;
+                if datagram.len() < 4 { continue; }
+                let magic = u32::from_le_bytes(datagram[..4].try_into().unwrap());
+                if magic == audio::MAGIC {
+                    if audio::valid_packet(&datagram) {
+                        state.audio_incoming.lock().unwrap().push(datagram.to_vec(), Instant::now());
+                    }
+                    // Malformed or lost audio cannot terminate video/control.
+                    continue;
+                }
+                if magic != video::MAGIC { continue; }
                 if datagram.len() >= 12 && !wait_idr && u64::from_le_bytes(datagram[4..12].try_into().unwrap()) < expected { continue; }
                 if let Some((sequence, data)) = assembly.push(&datagram, Instant::now())? {
                     if !valid_video(&data) || video_sequence(&data) != sequence { return Err("invalid assembled video frame header".into()); }
@@ -1259,6 +1423,74 @@ pub unsafe extern "C" fn remote_bulk_pending(ptr: *mut Handle) -> u32 {
     guarded(0, || {
         handle(ptr).map_or(0, |h| {
             h.shared.bulk_incoming.lock().unwrap().data.len() as u32
+        })
+    })
+}
+#[no_mangle]
+pub unsafe extern "C" fn remote_audio_send(ptr: *mut Handle, data: *const u8, len: usize) -> i32 {
+    guarded(-1, || {
+        let Some(handle) = handle(ptr) else {
+            return -1;
+        };
+        if data.is_null() || len != audio::PACKET_BYTES {
+            return -1;
+        }
+        let packet = std::slice::from_raw_parts(data, len);
+        if !audio::valid_packet(packet) {
+            return -1;
+        }
+        let state = &handle.shared;
+        let mut queue = state.audio_outgoing.lock().unwrap();
+        if state.status.load(Ordering::Acquire) != 1 || !state.audio_active.load(Ordering::Acquire)
+        {
+            return -1;
+        }
+        if !state.audio_send_enabled.load(Ordering::Acquire) {
+            return 0;
+        }
+        queue.push(packet.to_vec(), Instant::now());
+        state.audio_send_notify.notify_one();
+        1
+    })
+}
+#[no_mangle]
+pub unsafe extern "C" fn remote_audio_poll(
+    ptr: *mut Handle,
+    data: *mut u8,
+    capacity: usize,
+) -> i32 {
+    guarded(-1, || {
+        let Some(handle) = handle(ptr) else {
+            return -1;
+        };
+        if data.is_null() {
+            return -1;
+        }
+        let state = &handle.shared;
+        let mut queue = state.audio_incoming.lock().unwrap();
+        let now = Instant::now();
+        let Some(len) = queue.front_len(now) else {
+            return if state.status.load(Ordering::Acquire) == 1
+                && state.audio_active.load(Ordering::Acquire)
+            {
+                0
+            } else {
+                -1
+            };
+        };
+        if len > capacity {
+            return -1;
+        }
+        let packet = queue.pop(now).unwrap();
+        std::ptr::copy_nonoverlapping(packet.data.as_ptr(), data, len);
+        len as i32
+    })
+}
+#[no_mangle]
+pub unsafe extern "C" fn remote_audio_pending(ptr: *mut Handle) -> u32 {
+    guarded(0, || {
+        handle(ptr).map_or(0, |h| {
+            h.shared.audio_incoming.lock().unwrap().len(Instant::now()) as u32
         })
     })
 }
@@ -1538,6 +1770,429 @@ pub unsafe extern "C" fn remote_close(ptr: *mut Handle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn audio_negotiation_is_versioned_and_cannot_inherit_a_fast_reconnect() {
+        let shared = Arc::new(Shared::new());
+        shared.status.store(1, Ordering::Release);
+        shared.begin_audio_session();
+        let (stop, _) = watch::channel(false);
+        let mut handle = Handle {
+            shared,
+            stop,
+            worker: None,
+        };
+        let ptr = &mut handle as *mut _;
+        let packet = audio::test_packet(0);
+        for request in [
+            b"not json".as_slice(),
+            br#"{"type":"audio-start"}"#,
+            br#"{"type":"audio-start","version":2}"#,
+            br#"{"type":"audio-start","version":"1"}"#,
+            br#"{"type":"audio-start","version":1.0}"#,
+            br#"{"type":"not-audio","version":1}"#,
+        ] {
+            handle.shared.audio_control(request);
+            assert_eq!(
+                unsafe { remote_audio_send(ptr, packet.as_ptr(), packet.len()) },
+                0
+            );
+        }
+        handle
+            .shared
+            .audio_control(br#"{"type":"audio-start","version":1}"#);
+        assert_eq!(
+            unsafe { remote_audio_send(ptr, packet.as_ptr(), packet.len()) },
+            1
+        );
+        handle
+            .shared
+            .audio_control(br#"{"type":"audio-stop","version":1}"#);
+        assert_eq!(
+            unsafe { remote_audio_send(ptr, packet.as_ptr(), packet.len()) },
+            0
+        );
+        assert_eq!(
+            handle
+                .shared
+                .audio_outgoing
+                .lock()
+                .unwrap()
+                .len(Instant::now()),
+            0
+        );
+        handle
+            .shared
+            .audio_control(br#"{"type":"audio-start","version":1}"#);
+        assert_eq!(
+            unsafe { remote_audio_send(ptr, packet.as_ptr(), packet.len()) },
+            1
+        );
+        // Simulate a native caller that never observed the intermediate status 0.
+        // A new media session independently discards requests and packets.
+        handle.shared.begin_audio_session();
+        assert_eq!(unsafe { remote_status(ptr) }, 1);
+        assert_eq!(
+            unsafe { remote_audio_send(ptr, packet.as_ptr(), packet.len()) },
+            0
+        );
+        assert_eq!(
+            handle
+                .shared
+                .audio_outgoing
+                .lock()
+                .unwrap()
+                .len(Instant::now()),
+            0
+        );
+    }
+
+    #[test]
+    fn authenticated_audio_request_is_not_inherited_by_a_legacy_reconnecting_client() {
+        let (server, address, identity) = network_fixture("audio-negotiate");
+        let client = start(
+            Mode::Client {
+                server: address,
+                pin: None,
+            },
+            "123456".into(),
+        )
+        .unwrap();
+        wait_status(client, 1);
+        wait_status(server, 1);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !unsafe { &*server }
+            .shared
+            .audio_active
+            .load(Ordering::Acquire)
+        {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        let packet = audio::test_packet(0);
+        assert_eq!(
+            unsafe { remote_audio_send(server, packet.as_ptr(), packet.len()) },
+            0
+        );
+        let request = br#"{"type":"audio-start","version":1}"#;
+        assert_eq!(
+            unsafe { remote_send(client, 1, request.as_ptr(), request.len()) },
+            1
+        );
+        while !unsafe { &*server }
+            .shared
+            .audio_send_enabled
+            .load(Ordering::Acquire)
+        {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            unsafe { remote_audio_send(server, packet.as_ptr(), packet.len()) },
+            1
+        );
+        unsafe {
+            remote_close(client);
+        }
+        wait_status(server, 0);
+        let legacy = start(
+            Mode::Client {
+                server: address,
+                pin: None,
+            },
+            "123456".into(),
+        )
+        .unwrap();
+        wait_status(legacy, 1);
+        wait_status(server, 1);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !unsafe { &*server }
+            .shared
+            .audio_active
+            .load(Ordering::Acquire)
+        {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            unsafe { remote_audio_send(server, packet.as_ptr(), packet.len()) },
+            0
+        );
+        assert_eq!(unsafe { remote_audio_pending(legacy) }, 0);
+        let input = [72; 32];
+        assert_eq!(
+            unsafe { remote_send(legacy, INPUT, input.as_ptr(), input.len()) },
+            1
+        );
+        let mut buffer = [0; 128];
+        let mut channel = 0;
+        loop {
+            if unsafe { remote_poll(server, &mut channel, buffer.as_mut_ptr(), buffer.len()) } == 32
+                && channel == INPUT
+                && buffer[..32] == input
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        unsafe {
+            remote_close(legacy);
+            remote_close(server);
+        }
+        std::fs::remove_dir_all(identity).unwrap();
+    }
+
+    #[test]
+    fn audio_ffi_validates_bounds_retains_small_poll_and_clears_on_session_end() {
+        let shared = Arc::new(Shared::new());
+        shared.status.store(1, Ordering::Release);
+        shared.audio_active.store(true, Ordering::Release);
+        shared.audio_send_enabled.store(true, Ordering::Release);
+        let (stop, _) = watch::channel(false);
+        let mut handle = Handle {
+            shared,
+            stop,
+            worker: None,
+        };
+        let ptr = &mut handle as *mut _;
+        let packet = audio::test_packet(9);
+        assert_eq!(
+            unsafe { remote_audio_send(ptr, std::ptr::null(), packet.len()) },
+            -1
+        );
+        assert_eq!(unsafe { remote_audio_send(ptr, packet.as_ptr(), 0) }, -1);
+        assert_eq!(
+            unsafe { remote_audio_send(ptr, packet.as_ptr(), packet.len() + 1) },
+            -1
+        );
+        let mut invalid = packet.clone();
+        invalid[12] = 2;
+        assert_eq!(
+            unsafe { remote_audio_send(ptr, invalid.as_ptr(), invalid.len()) },
+            -1
+        );
+        assert_eq!(
+            unsafe { remote_audio_send(std::ptr::null_mut(), packet.as_ptr(), packet.len()) },
+            -1
+        );
+        for _ in 0..40 {
+            assert_eq!(
+                unsafe { remote_audio_send(ptr, packet.as_ptr(), packet.len()) },
+                1
+            );
+        }
+        assert_eq!(
+            handle
+                .shared
+                .audio_outgoing
+                .lock()
+                .unwrap()
+                .len(Instant::now()),
+            audio::QUEUE_PACKETS
+        );
+        handle
+            .shared
+            .audio_incoming
+            .lock()
+            .unwrap()
+            .push(packet.clone(), Instant::now());
+        assert_eq!(unsafe { remote_pending(ptr, VIDEO) }, 0);
+        let mut small = [0; 32];
+        assert_eq!(
+            unsafe { remote_audio_poll(ptr, small.as_mut_ptr(), small.len()) },
+            -1
+        );
+        assert_eq!(unsafe { remote_audio_pending(ptr) }, 1);
+        let mut buffer = vec![0; audio::PACKET_BYTES];
+        assert_eq!(
+            unsafe { remote_audio_poll(ptr, buffer.as_mut_ptr(), buffer.len()) },
+            audio::PACKET_BYTES as i32
+        );
+        assert_eq!(buffer, packet);
+        handle
+            .shared
+            .audio_incoming
+            .lock()
+            .unwrap()
+            .push(packet.clone(), Instant::now());
+        handle.shared.clear_audio();
+        assert_eq!(unsafe { remote_audio_pending(ptr) }, 0);
+        assert_eq!(
+            unsafe { remote_audio_send(ptr, packet.as_ptr(), packet.len()) },
+            -1
+        );
+        assert_eq!(
+            unsafe { remote_audio_poll(ptr, buffer.as_mut_ptr(), buffer.len()) },
+            -1
+        );
+        assert_eq!(
+            handle
+                .shared
+                .audio_outgoing
+                .lock()
+                .unwrap()
+                .len(Instant::now()),
+            0
+        );
+    }
+
+    #[test]
+    fn encrypted_audio_coexists_with_video_input_and_ignores_malformed_sound() {
+        let (server, address, identity) = network_fixture("audio");
+        let client = start(
+            Mode::Client {
+                server: address,
+                pin: None,
+            },
+            "123456".into(),
+        )
+        .unwrap();
+        wait_status(client, 1);
+        wait_status(server, 1);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !unsafe { &*server }
+            .shared
+            .audio_active
+            .load(Ordering::Acquire)
+            || !unsafe { &*client }
+                .shared
+                .audio_active
+                .load(Ordering::Acquire)
+        {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        let audio_start = br#"{"type":"audio-start","version":1}"#;
+        assert_eq!(
+            unsafe { remote_send(client, 1, audio_start.as_ptr(), audio_start.len()) },
+            1
+        );
+        while !unsafe { &*server }
+            .shared
+            .audio_send_enabled
+            .load(Ordering::Acquire)
+        {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Authenticated media connection, but an invalid packet from a peer:
+        // sound corruption must not take down the other channel tasks.
+        let media = unsafe { &*server }
+            .shared
+            .active_connections
+            .lock()
+            .unwrap()[1]
+            .clone();
+        let mut malformed = audio::test_packet(999);
+        malformed[12] = 2;
+        media.send_datagram(Bytes::from(malformed)).unwrap();
+        media.send_datagram(Bytes::from_static(b"RFA1")).unwrap();
+
+        let mut frame = vec![17; 160000];
+        frame[..4].copy_from_slice(&0x31524652u32.to_le_bytes());
+        frame[4..8].copy_from_slice(&1920u32.to_le_bytes());
+        frame[8..12].copy_from_slice(&1080u32.to_le_bytes());
+        frame[12..16].copy_from_slice(&1u32.to_le_bytes());
+        frame[16..24].copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(
+            unsafe { remote_send(server, VIDEO, frame.as_ptr(), frame.len()) },
+            1
+        );
+        let input = [61; 32];
+        assert_eq!(
+            unsafe { remote_send(client, INPUT, input.as_ptr(), input.len()) },
+            1
+        );
+
+        let mut audio_buffer = vec![0; audio::PACKET_BYTES];
+        let mut video_buffer = vec![0; video::MAX_FRAME];
+        let mut input_buffer = [0; 64];
+        let mut audio_received = 0;
+        let mut last_audio = None;
+        let mut got_video = false;
+        let mut got_input = false;
+        let mut sequence = 0;
+        let mut next_send = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if sequence < 40 && Instant::now() >= next_send {
+                let packet = audio::test_packet(sequence);
+                assert_eq!(
+                    unsafe { remote_audio_send(server, packet.as_ptr(), packet.len()) },
+                    1
+                );
+                sequence += 1;
+                next_send = Instant::now() + Duration::from_millis(5);
+            }
+            if unsafe { remote_audio_poll(client, audio_buffer.as_mut_ptr(), audio_buffer.len()) }
+                > 0
+            {
+                let received_sequence =
+                    u64::from_le_bytes(audio_buffer[16..24].try_into().unwrap());
+                assert!(received_sequence < 40);
+                assert_eq!(
+                    &audio_buffer[audio::HEADER_BYTES..],
+                    &audio::test_packet(received_sequence)[audio::HEADER_BYTES..]
+                );
+                audio_received += 1;
+                last_audio = Some(received_sequence);
+            }
+            let mut channel = 0;
+            let video_len = unsafe {
+                remote_poll(
+                    client,
+                    &mut channel,
+                    video_buffer.as_mut_ptr(),
+                    video_buffer.len(),
+                )
+            };
+            if channel == VIDEO && video_len > 0 {
+                assert_eq!(&video_buffer[..video_len as usize], frame);
+                got_video = true;
+            }
+            let input_len = unsafe {
+                remote_poll(
+                    server,
+                    &mut channel,
+                    input_buffer.as_mut_ptr(),
+                    input_buffer.len(),
+                )
+            };
+            if channel == INPUT && input_len == 32 && input_buffer[..32] == input {
+                got_input = true;
+            }
+            if last_audio == Some(39) && got_video && got_input {
+                break;
+            }
+            assert!(Instant::now() < deadline, "media/input incomplete: audio={audio_received}, last={last_audio:?}, video={got_video}, input={got_input}");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            audio_received >= 32,
+            "unexpected loopback audio loss: {audio_received}/40"
+        );
+        assert_eq!(unsafe { remote_status(server) }, 1);
+        assert_eq!(unsafe { remote_status(client) }, 1);
+        let before = Instant::now();
+        unsafe {
+            remote_close(client);
+        }
+        wait_status(server, 0);
+        assert_eq!(unsafe { remote_audio_pending(server) }, 0);
+        assert_eq!(
+            unsafe { remote_audio_send(server, audio_buffer.as_ptr(), audio_buffer.len()) },
+            -1
+        );
+        unsafe {
+            remote_close(server);
+        }
+        assert!(
+            before.elapsed() < Duration::from_secs(2),
+            "audio did not stop promptly"
+        );
+        std::fs::remove_dir_all(identity).unwrap();
+    }
+
     #[test]
     fn bulk_capability_proofs_separate_roles_exporters_and_sessions() {
         let ticket = [19; 32];

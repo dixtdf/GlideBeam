@@ -2,6 +2,8 @@
 
 Build from the repository root. `VERSION` controls release names and UI version metadata. Rust 1.99.0 is pinned in `rust-toolchain.toml`; use `--locked` to preserve `Cargo.lock`. First-party native code requires C++20.
 
+Audio is currently a development-branch feature; released `v0.2.1` binaries do not contain it. The paired audio tests used `0.3.0-dev.audio`: pass `-Version 0.3.0-dev.audio` to the Windows build and use `0.3.0-dev.audio` as the third argument of `build-macos.sh` for matching test metadata. Build both endpoints from the same branch. These overrides do not create a release or change `VERSION`.
+
 ## Windows x64
 
 Install Rust/rustup, Python 3, and the MSYS2 UCRT64 GCC toolchain. Use `mingw-w64-ucrt-x86_64-gcc`, with its `ucrt64/bin` directory on PATH. The public repository does not contain a downloaded toolchain.
@@ -61,5 +63,7 @@ The notice collector reads resolved registry package sources from `cargo metadat
 ```
 
 Mac supports `--language en` or `--language zh-Hans` with `--preview-ui PATH.png`. A CLI language override is temporary; normal UI language changes are persisted. `--self-test-restart` uses mock authorization and compiles fixed AppleScript without rebooting. Hosted CI does not run hardware capture/codec sessions. Use a paired real desktop to assess hardware acceleration and interactive latency.
+
+The native test scripts also compile the audio packetizer, jitter/playout simulations and Windows sample-format probe. Windows audio links the system `avrt.dll` for MMCSS; no external audio codec is bundled. To inspect an existing paired session from Windows without recording or playing audio, run `python scripts/probe-audio.py --runtime dist/windows-x64 --seconds 18 --output build/audio-probe.json`. It reports packet format, sequence gaps and per-channel RMS while consuming video separately. Play a known sound on the Mac during this check; a silent stream does not establish that system sound was captured. See [audio validation](audio.md) for device and listening checks.
 
 See [release automation](release.md) for the equivalent hosted builds.

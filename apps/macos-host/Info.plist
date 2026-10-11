@@ -13,7 +13,7 @@
   <key>CFBundleVersion</key><string>8</string>
   <key>LSMinimumSystemVersion</key><string>15.2</string>
   <key>LSUIElement</key><true/>
-  <key>NSScreenCaptureUsageDescription</key><string>Share this Mac desktop with a paired Windows computer.</string>
+  <key>NSScreenCaptureUsageDescription</key><string>Share this Mac desktop and system audio with a paired Windows computer.</string>
   <key>NSLocalNetworkUsageDescription</key><string>Accept remote desktop connections from paired Windows computers on your local network.</string>
   <key>NSAppleEventsUsageDescription</key><string>Use your authorized Accessibility access to receive remote keyboard and mouse input.</string>
   <key>NSHighResolutionCapable</key><true/>

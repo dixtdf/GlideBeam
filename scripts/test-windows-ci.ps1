@@ -31,6 +31,15 @@ try {
  Invoke-ClientTest '--selftest-exchange-hang' 'file-panel-hang.json'
  Invoke-ClientTest '--selftest-ui' 'ui.json'
  $taskCommon = @('-std=c++20', '-O2', '-Wall', '-Wextra', '-Werror', '-static-libgcc', '-static-libstdc++')
+ $taskAudioPlayout = Join-Path $taskOutput 'audio-playout.exe'
+ Invoke-Checked $taskCompiler ($taskCommon + @('shared/probes/audio-playout-test.cpp', '-o', $taskAudioPlayout))
+ Invoke-Checked $taskAudioPlayout @()
+ $taskAudioCapture = Join-Path $taskOutput 'audio-packetizer.exe'
+ Invoke-Checked $taskCompiler ($taskCommon + @('apps/macos-host/probes/audio-packetizer-test.cpp', '-o', $taskAudioCapture))
+ Invoke-Checked $taskAudioCapture @()
+ $taskAudioDevice = Join-Path $taskOutput 'audio-format.exe'
+ Invoke-Checked $taskCompiler ($taskCommon + @('apps/windows-client/probes/audio-player.cpp', '-o', $taskAudioDevice, '-lole32', '-luuid', '-lavrt'))
+ Invoke-Checked $taskAudioDevice @()
  $taskEngine = Join-Path $taskOutput 'exchange-core.exe'
  Invoke-Checked $taskCompiler ($taskCommon + @('-DREMOTE_EXCHANGE_TEST_HOOKS', 'shared/probes/exchange-test.cpp', 'shared/exchange.cpp', 'shared/diagnostic-log.cpp', '-o', $taskEngine, '-lole32', '-lcrypt32'))
  Invoke-Checked $taskEngine @()

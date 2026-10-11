@@ -21,6 +21,16 @@ int remote_bulk_send(remote_endpoint* endpoint, const uint8_t* data, size_t len)
    preserves the queued frame. Allocate 1 MiB; separate from remote_poll. */
 int remote_bulk_poll(remote_endpoint* endpoint, uint8_t* data, size_t capacity);
 uint32_t remote_bulk_pending(remote_endpoint* endpoint);
+/* Negotiated system audio: one RemoteAudioHeader + 240 stereo PCM16 frames (992 bytes).
+   Requires control-channel audio-start/version=1 agreement before the host calls send.
+   1 accepted, 0 not negotiated/dropped/backpressure, -1 invalid/not connected. No retries.
+   An eight-packet burst queue expires sound after 20 ms of waiting, drops oldest
+   sound on overload, and sets the discontinuity flag. */
+int remote_audio_send(remote_endpoint* endpoint, const uint8_t* data, size_t len);
+/* Nonblocking and separate from remote_poll/video decoding. Length, 0 empty, -1 invalid
+   or disconnected. A buffer smaller than 992 bytes preserves the unexpired packet. */
+int remote_audio_poll(remote_endpoint* endpoint, uint8_t* data, size_t capacity);
+uint32_t remote_audio_pending(remote_endpoint* endpoint);
 double remote_rtt_ms(remote_endpoint* endpoint);
 uint32_t remote_pending(remote_endpoint* endpoint, uint32_t channel);
 int remote_send(remote_endpoint* endpoint, uint32_t channel, const uint8_t* data, size_t len);
@@ -51,6 +61,15 @@ typedef struct RemoteFrameHeader {
     uint64_t sequence;
     uint64_t capture_time_us;
 } RemoteFrameHeader;
+typedef struct RemoteAudioHeader {
+    uint32_t magic; /* 0x31414652 = RFA1 */
+    uint32_t sample_rate; /* 48000 */
+    uint16_t channels; /* 2 */
+    uint16_t frames; /* 240 = 5 ms; followed by 960 bytes interleaved stereo PCM16 LE */
+    uint32_t flags; /* bit 0 discontinuity; all other bits reserved */
+    uint64_t sequence;
+    uint64_t capture_time_us; /* host monotonic clock; not directly comparable to client clock */
+} RemoteAudioHeader;
 enum { INPUT_MOVE=1, INPUT_BUTTON=2, INPUT_SCROLL=3, INPUT_KEY=4, INPUT_RELEASE_ALL=5, INPUT_TEXT=6, INPUT_KEYFRAME=7, INPUT_PASTE=8 };
 typedef struct RemoteInputEvent {
     uint32_t type;

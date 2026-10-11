@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include "audio.h"
 namespace remote_exchange { class Session; }
 
 struct ConnectionOptions {
@@ -35,6 +36,9 @@ struct SessionSnapshot {
     uint64_t actualFrames = 0;
     MacVideoEncoderMode macEncoderMode = MacVideoEncoderMode::Unknown;
     bool hardwareDecode = false;
+    AudioPlaybackSnapshot audio;
+    // Empty until a compatible host acknowledges the optional audio protocol.
+    std::string macAudioState;
     bool restartSupported = false;
     bool restartRequiresLocalAuthorization = true;
     bool restartBusy = false;
@@ -56,6 +60,7 @@ public:
     // UI presents its confirmation dialog before calling. The authenticated
     // host performs its own local macOS authorization.
     virtual bool RestartMac() { return false; }
+    virtual void SetAudioMuted(bool) {}
 };
 int CreateUi(HINSTANCE instance, int showCommand, IClientSession& session,
              const ConnectionOptions& initialOptions = {}, bool autoConnect = false);

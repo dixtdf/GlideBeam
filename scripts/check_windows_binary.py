@@ -10,7 +10,7 @@ SYSTEM_DLLS = {
     "gdi32.dll", "imm32.dll", "kernel32.dll", "mf.dll", "mfplat.dll",
     "ntdll.dll", "ole32.dll", "oleaut32.dll", "shell32.dll", "shlwapi.dll",
     "user32.dll", "userenv.dll", "ucrtbase.dll", "version.dll",
-    "windowscodecs.dll", "winmm.dll", "ws2_32.dll", "msvcrt.dll",
+    "windowscodecs.dll", "winmm.dll", "ws2_32.dll", "msvcrt.dll", "avrt.dll",
 }
 
 
