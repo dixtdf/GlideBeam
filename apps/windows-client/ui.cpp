@@ -64,7 +64,7 @@ constexpr wchar_t kWindowClass[] = L"RemoteNativeWindow";
 constexpr wchar_t kCanvasClass[] = L"RemoteNativeCanvas";
 constexpr wchar_t kOverlayClass[] = L"RemoteNativeSessionOverlay";
 constexpr float kToolbarWidth = 762.f, kToolbarHeight = 64.f;
-constexpr float kMetricsWidth = 400.f, kMetricsHeight = 456.f;
+constexpr float kMetricsWidth = 400.f, kMetricsHeight = 534.f;
 constexpr float kCaptureNoticeWidth = 480.f, kCaptureNoticeHeight = 172.f;
 constexpr float kNavWidth = 206.f;
 const wchar_t* MacEncoderText(const SessionSnapshot& snapshot) {
@@ -466,9 +466,17 @@ struct Ui {
         std::swprintf(value,64,L"%.1f / %.1f ms",snapshot.audio.deviceQueuedMs,snapshot.audio.devicePeriodMs);row(L"声卡排队 / 周期",value,313);
         std::swprintf(value,64,L"%llu / %llu",static_cast<unsigned long long>(snapshot.audio.underruns),static_cast<unsigned long long>(snapshot.audio.lost));row(L"音频欠载 / 丢包",value,339);
         std::swprintf(value,64,L"%llu",static_cast<unsigned long long>(snapshot.audio.deviceUnderruns));row(L"声卡耗尽事件",value,365);
-        out.Line(18, 401, kMetricsWidth - 18, 401, LINE);
-        out.Text(preview ? L"合成数据 · 仅用于界面预览" : L"处理时间为 CPU 计时，含解码、转换与提交。", 18, 407, kMetricsWidth - 36, 22, 9, MUTED);
-        out.Text(L"该数值不代表完整交互延迟。", 18, 429, kMetricsWidth - 36, 19, 9, MUTED);
+        auto hostP95=[&](const HostStageTiming& timing){
+            if(timing.available&&timing.windowSamples)std::swprintf(value,64,L"%.2f ms P95",timing.p95Ms);else std::wcscpy(value,L"\u2014");
+        };
+        hostP95(snapshot.hostVideoTiming.captureCompleteInterval);row(L"Mac 画面间隔",value,391);
+        hostP95(snapshot.hostVideoTiming.encodeCallback);row(L"Mac 编码回调",value,417);
+        if(snapshot.videoTiming.presentCall.windowSamples)std::swprintf(value,64,L"%.2f ms P95",snapshot.videoTiming.presentCall.p95Us/1000.0);
+        else std::wcscpy(value,L"\u2014");
+        row(L"Windows 显示提交",value,443);
+        out.Line(18, 479, kMetricsWidth - 18, 479, LINE);
+        out.Text(preview ? L"合成数据 · 仅用于界面预览" : L"处理时间为 CPU 计时，含解码、转换与提交。", 18, 485, kMetricsWidth - 36, 22, 9, MUTED);
+        out.Text(L"最近 256 次计时的 P95，非完整交互延迟。", 18, 507, kMetricsWidth - 36, 19, 9, MUTED);
     }
     void DrawSyntheticDesktop() {
         // Entirely synthetic artwork; no screen capture, host connection or credentials.

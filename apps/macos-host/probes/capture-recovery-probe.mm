@@ -4,6 +4,7 @@
 #include "../main.mm"
 #undef main
 #include <condition_variable>
+#include <future>
 
 static void DrainRecoveryCallbacks() {
     NSDate *until=[NSDate dateWithTimeIntervalSinceNow:0.06];
@@ -33,6 +34,22 @@ int main(int argc,const char **argv) {
         check(@"system_stop_is_transient",CaptureFailurePolicy(true,SCStreamErrorSystemStoppedStream)==CaptureFailure::Transient);
         check(@"wrong_domain_is_not_user_stop",CaptureFailurePolicy(false,SCStreamErrorUserStopped)==CaptureFailure::Transient);
         check(@"bounded_retry_backoff",CaptureRetryDelayUs(0)==1000000 && CaptureRetryDelayUs(1)==2000000 && CaptureRetryDelayUs(90)==16000000);
+        check(@"encoder_retirement_keeps_callback_ownership",EncoderFlightSelfTest());
+        {
+            EncoderWakeSignal wake;
+            auto old=std::make_shared<EncoderFlightState>(nullptr,&wake),replacementFlight=std::make_shared<EncoderFlightState>(nullptr,&wake);
+            auto make=[] { return std::make_unique<FrameMeta>(FrameMeta{0,0,nullptr,0,64,64}); };
+            auto key=old->Track(make());auto active=old->Take(key);
+            old->Retire();
+            auto replacementKey=replacementFlight->Track(make());
+            auto observed=wake.Observe();
+            old->Complete();active.reset();
+            check(@"retired_callback_wakes_without_opening_replacement_flight",wake.Observe()!=observed && old->inflight.load()==0 && replacementFlight->inflight.load()==1);
+            observed=wake.Observe();replacementFlight->Reject(replacementKey);
+            check(@"rejected_submission_wakes_after_opening_gate",wake.Observe()!=observed && replacementFlight->inflight.load()==0);
+            observed=wake.Observe();replacementFlight->Retire();
+            check(@"retirement_notifies_blocked_encoder",wake.Observe()!=observed);
+        }
         RemoteHost *host=[[RemoteHost alloc] initWithBind:@"127.0.0.1:0" token:@"fixture-token" identity:@"" videoCursor:NO requestPermissions:NO background:YES];
         NSObject *source=[NSObject new], *replacement=[NSObject new];
         CVPixelBufferRef pixel=nullptr;
@@ -44,18 +61,57 @@ int main(int argc,const char **argv) {
         CMSampleBufferRef complete=RecoverySample(pixel,SCFrameStatusComplete);
         check(@"owned_sample_created",complete && CMSampleBufferIsValid(complete));
         if(!complete){CVPixelBufferRelease(pixel);return 2;}
+        uint64_t wakeBefore=host->_encoderWake.Observe();
         [host stream:(SCStream *)source didOutputSampleBuffer:complete ofType:SCStreamOutputTypeScreen];
         DrainRecoveryCallbacks();
-        uint64_t capturedUs=0;
-        CVPixelBufferRef taken=host->_captureFrames.Take(host->_frameEpoch.load(),false,capturedUs);
+        check(@"complete_publication_notifies_encoder",host->_encoderWake.Observe()!=wakeBefore);
+        check(@"source_complete_count_is_not_submission_count",host->_captureComplete.load()==1 && host->_captured.load()==0);
+        uint64_t capturedUs=0,enqueuedUs=0;bool fresh=false;
+        CVPixelBufferRef taken=host->_captureFrames.Take(host->_frameEpoch.load(),false,capturedUs,&enqueuedUs,&fresh);
         check(@"complete_frame_published",taken==pixel && capturedUs>0 && host->_captureActive.load());
+        check(@"mailbox_records_local_enqueue_separate_from_source_pts",fresh && capturedUs==16667 && enqueuedUs>0 && enqueuedUs<=NowUs());
         if(taken)CVPixelBufferRelease(taken);
         taken=host->_captureFrames.Take(host->_frameEpoch.load(),false,capturedUs);
         check(@"unchanged_frame_not_reencoded",taken==nullptr);
         if(taken)CVPixelBufferRelease(taken);
-        taken=host->_captureFrames.Take(host->_frameEpoch.load(),true,capturedUs);
+        taken=host->_captureFrames.Take(host->_frameEpoch.load(),true,capturedUs,&enqueuedUs,&fresh);
         check(@"active_static_frame_can_supply_idr",taken==pixel);
+        check(@"cached_idr_is_not_fresh_waiting_frame",!fresh);
         if(taken)CVPixelBufferRelease(taken);
+        CMSampleBufferRef idle=RecoverySample(pixel,SCFrameStatusIdle);
+        [host stream:(SCStream *)source didOutputSampleBuffer:idle ofType:SCStreamOutputTypeScreen];
+        DrainRecoveryCallbacks();
+        check(@"idle_callback_does_not_count_as_complete",host->_captureIdle.load()==1 && host->_captureComplete.load()==1 && host->_captureCallbacks.load()==2);
+        check(@"callback_intervals_use_local_clock",host->_captureInterval.Snapshot().windowSamples==1 && host->_captureInterval.Snapshot().lastUs>0);
+        {
+            // Queue the production recovery, replace its epoch, and publish a
+            // static Complete frame before its queued block clears the gate.
+            // Keep frame status unchanged so no UI transition can accidentally
+            // supply the notification that this regression is checking.
+            RemoteHost *gated=[[RemoteHost alloc] initWithBind:@"127.0.0.1:0" token:@"fixture-token" identity:@"" videoCursor:NO requestPermissions:NO background:YES];
+            uint64_t staleEpoch=gated->_frameEpoch.load();
+            [gated encoderFailed:paramErr epoch:staleEpoch immediately:YES];
+            { std::lock_guard lock(gated->_captureLock);
+              [gated invalidateCaptureSourceLocked];
+              gated->_captureSource.store((__bridge void *)replacement);
+              gated->_captureFrameState.store(SCFrameStatusComplete); }
+            [gated stream:(SCStream *)replacement didOutputSampleBuffer:complete ofType:SCStreamOutputTypeScreen];
+            check(@"static_replacement_frame_arrives_while_recovery_gate_closed",gated->_encoderRecoveryScheduled.load() && gated->_captureActive.load());
+            auto observed=gated->_encoderWake.Observe();
+            auto waiter=std::async(std::launch::async,[gated,observed] {
+                if(!gated->_encoderWake.Wait(observed) || gated->_encoderRecoveryScheduled.load())return false;
+                uint64_t captured=0;bool fresh=false;
+                CVPixelBufferRef pending=gated->_captureFrames.Take(gated->_frameEpoch.load(),true,captured,nullptr,&fresh);
+                bool valid=pending && fresh;
+                if(pending)CVPixelBufferRelease(pending);
+                return valid;
+            });
+            DrainRecoveryCallbacks();
+            check(@"stale_encoder_recovery_clears_gate",!gated->_encoderRecoveryScheduled.load());
+            bool resumed=waiter.wait_for(std::chrono::seconds(2))==std::future_status::ready;
+            if(!resumed)gated->_encoderWake.Stop();
+            check(@"static_pending_idr_woken_after_stale_recovery",resumed && waiter.get());
+        }
         uint64_t oldEpoch=host->_frameEpoch.load();
         CMSampleBufferRef suspended=RecoverySample(pixel,SCFrameStatusSuspended);
         [host stream:(SCStream *)source didOutputSampleBuffer:suspended ofType:SCStreamOutputTypeScreen];
@@ -69,13 +125,17 @@ int main(int argc,const char **argv) {
         DrainRecoveryCallbacks();
         check(@"same_stream_resume_recovers",host->_captureActive.load() && [host->_captureState isEqualToString:@"running"]);
         uint64_t lifecycle=host->_captureEpoch.load();
+        wakeBefore=host->_encoderWake.Observe();
         [host stopCapture];
+        check(@"stopping_capture_notifies_waiting_encoder",host->_encoderWake.Observe()!=wakeBefore);
         taken=host->_captureFrames.Take(host->_frameEpoch.load(),true,capturedUs);
         check(@"stop_invalidates_lifecycle_and_pixels",!taken && host->_captureEpoch.load()>lifecycle && !host->_captureActive.load() && !host->_capturing && !host->_starting);
         if(taken)CVPixelBufferRelease(taken);
+        auto completeBefore=host->_captureComplete.load();
         [host stream:(SCStream *)source didOutputSampleBuffer:complete ofType:SCStreamOutputTypeScreen];
         taken=host->_captureFrames.Take(host->_frameEpoch.load(),true,capturedUs);
         check(@"late_frame_from_old_stream_ignored",!taken);
+        check(@"late_old_frame_cannot_increment_source_metrics",host->_captureComplete.load()==completeBefore);
         if(taken)CVPixelBufferRelease(taken);
         // Hold the production lifecycle gate while an old Complete callback
         // attempts entry. Perform the exact production invalidation under the
@@ -130,7 +190,7 @@ int main(int argc,const char **argv) {
         [host tick:nil];
         check(@"hung_stop_completion_is_bounded",!host->_stopping && host->_captureEpoch.load()>lifecycle);
         host->_running.store(false);
-        CFRelease(suspended);CFRelease(complete);CVPixelBufferRelease(pixel);
+        CFRelease(idle);CFRelease(suspended);CFRelease(complete);CVPixelBufferRelease(pixel);
         bool passed=true;unsigned passedCount=0,skippedCount=0;
         for(NSDictionary *c in checks) {if([c[@"skipped"] boolValue]){++skippedCount;continue;}if([c[@"passed"] boolValue])++passedCount;else passed=false;}
         NSDictionary *report=@{@"passed":@(passed),@"passed_count":@(passedCount),@"skipped_count":@(skippedCount),@"scope":@"Production capture lifecycle with owned synthetic CMSampleBuffer; no desktop capture or system UI clicks",@"checks":checks};

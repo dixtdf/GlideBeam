@@ -31,6 +31,15 @@ try {
  Invoke-ClientTest '--selftest-exchange-hang' 'file-panel-hang.json'
  Invoke-ClientTest '--selftest-ui' 'ui.json'
  $taskCommon = @('-std=c++20', '-O2', '-Wall', '-Wextra', '-Werror', '-static-libgcc', '-static-libstdc++')
+ $taskLatency = Join-Path $taskOutput 'latency-stats.exe'
+ Invoke-Checked $taskCompiler ($taskCommon + @('shared/probes/latency-stats-test.cpp', '-o', $taskLatency))
+ Invoke-Checked $taskLatency @()
+ $taskEncoderWake = Join-Path $taskOutput 'encoder-wake.exe'
+ Invoke-Checked $taskCompiler ($taskCommon + @('apps/macos-host/probes/encoder-wake-test.cpp', '-o', $taskEncoderWake))
+ Invoke-Checked $taskEncoderWake @()
+ $taskWorkerWait = Join-Path $taskOutput 'worker-wait.exe'
+ Invoke-Checked $taskCompiler ($taskCommon + @('apps/windows-client/probes/worker-wait.cpp', '-o', $taskWorkerWait))
+ Invoke-Checked $taskWorkerWait @()
  $taskAudioPlayout = Join-Path $taskOutput 'audio-playout.exe'
  Invoke-Checked $taskCompiler ($taskCommon + @('shared/probes/audio-playout-test.cpp', '-o', $taskAudioPlayout))
  Invoke-Checked $taskAudioPlayout @()
