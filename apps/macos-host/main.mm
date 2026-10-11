@@ -84,28 +84,59 @@ static OSStatus SetVT(VTCompressionSessionRef session, CFStringRef key, CFTypeRe
     Log(@"VT property %@ = %@, status=%d", (__bridge NSString *)key, (__bridge id)value, (int)result);
     return result;
 }
-static OSStatus ConfigureEncoder(VTCompressionSessionRef session) {
-    SetVT(session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
-    SetVT(session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+enum class H264EncoderMode { Unavailable, Hardware, AppleSoftware };
+struct H264EncoderConfiguration {
+    uint32_t width, height, codedHeight = 0, fps = 60;
+    bool layoutWorkaround = false;
+    H264EncoderMode mode = H264EncoderMode::Unavailable;
+};
+static NSString *EncoderModeName(H264EncoderMode mode) {
+    return mode == H264EncoderMode::Hardware ? @"hardware" :
+        mode == H264EncoderMode::AppleSoftware ? @"apple-software" : @"unavailable";
+}
+static NSString *EncoderID(VTCompressionSessionRef session) {
+    CFTypeRef value = nullptr;
+    OSStatus status = VTSessionCopyProperty(session, kVTCompressionPropertyKey_EncoderID, nullptr, &value);
+    NSString *result = status == noErr && value && CFGetTypeID(value) == CFStringGetTypeID() ?
+        [(__bridge NSString *)value copy] : @"";
+    if (value) CFRelease(value);
+    return result;
+}
+static bool ForceSoftwareH264() {
+    const char *value = getenv("GLIDEBEAM_FORCE_SOFTWARE_H264");
+    return value && strcmp(value, "1") == 0;
+}
+static OSStatus ConfigureEncoder(VTCompressionSessionRef session, bool requireHardware, uint32_t fps) {
+    OSStatus realtime = SetVT(session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
+    OSStatus reordering = SetVT(session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+    if (!requireHardware && (realtime != noErr || reordering != noErr)) return realtime != noErr ? realtime : reordering;
     SetVT(session, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel);
-    SetVT(session, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@60);
-    SetVT(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFNumberRef)@120);
+    SetVT(session, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@(fps));
+    SetVT(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFNumberRef)@(fps * 2));
     SetVT(session, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, (__bridge CFNumberRef)@2);
     SetVT(session, kVTCompressionPropertyKey_MaxFrameDelayCount, (__bridge CFNumberRef)@0);
     // Experimental NVIDIA VideoToolbox implementations may reject rate-control properties.
-    // Record the actual result and do not replace hardware encoding with a silent software path.
-    SetVT(session, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFNumberRef)@25000000);
+    // The fallback is explicit; both the UI and diagnostics identify software encoding.
+    SetVT(session, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFNumberRef)@(requireHardware ? 25000000 : 8000000));
+    OSStatus prepared = VTCompressionSessionPrepareToEncodeFrames(session);
+    Log(@"VT prepare mode=%@ status=%d", requireHardware ? @"hardware" : @"apple-software", (int)prepared);
+    if (prepared != noErr) return prepared;
     CFTypeRef hardware = nullptr;
     OSStatus hwStatus = VTSessionCopyProperty(session,
         kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
         kCFAllocatorDefault, &hardware);
     Log(@"VT hardware query status=%d value=%@", (int)hwStatus, hardware ? (__bridge id)hardware : @"unavailable");
-    bool rejectedHardware = hwStatus == noErr && hardware == kCFBooleanFalse;
+    bool hardwareUsed = hwStatus == noErr && hardware == kCFBooleanTrue;
     if (hardware) CFRelease(hardware);
-    if(rejectedHardware) { Log(@"Encoder reported software despite required hardware; refusing session"); return -1; }
-    OSStatus result = VTCompressionSessionPrepareToEncodeFrames(session);
-    Log(@"VT prepare status=%d", (int)result);
-    return result;
+    if (requireHardware && !hardwareUsed) {
+        Log(@"Hardware H264 session did not confirm hardware use; refusing candidate"); return paramErr;
+    }
+    // Apple software sessions may omit the hardware-use property. The explicit
+    // software specification plus the selected Apple encoder ID establish the mode.
+    if (!requireHardware && (hardwareUsed || ![EncoderID(session) isEqualToString:@"com.apple.videotoolbox.videoencoder.h264"])) {
+        Log(@"Software H264 session did not select the requested Apple encoder; refusing candidate"); return paramErr;
+    }
+    return noErr;
 }
 static void InitializeHardwareVideo() {
     static dispatch_once_t once;
@@ -173,6 +204,66 @@ static OSStatus CreateHardwareEncoder(uint32_t width,uint32_t visibleHeight,
     Log(@"Known NVENC layout correction enabled, visible=%ux%u coded=%ux%u",width,visibleHeight,width,padded);
     return noErr;
 }
+static OSStatus CreateStreamingEncoder(H264EncoderConfiguration& configuration,
+    VTCompressionOutputCallback callback, void *context, VTCompressionSessionRef *session, bool forceSoftware) {
+    *session = nullptr;
+    configuration.codedHeight = configuration.height;
+    configuration.layoutWorkaround = false;
+    configuration.mode = H264EncoderMode::Unavailable;
+    configuration.fps = 60;
+    auto discard = [&] {
+        if (*session) { VTCompressionSessionInvalidate(*session); CFRelease(*session); *session = nullptr; }
+    };
+    if (!forceSoftware) {
+        OSStatus hardware = CreateHardwareEncoder(configuration.width, configuration.height, callback, context,
+            session, &configuration.codedHeight, &configuration.layoutWorkaround);
+        if (hardware == noErr && *session) hardware = ConfigureEncoder(*session, true, configuration.fps);
+        if (hardware == noErr && *session) { configuration.mode = H264EncoderMode::Hardware; return noErr; }
+        Log(@"Hardware H264 unavailable create/configure status=%d; trying Apple software H264", (int)hardware);
+        discard();
+    } else Log(@"Apple software H264 explicitly selected for this capture");
+
+    // Bound CPU work while preserving aspect ratio. ScreenCaptureKit supplies
+    // NV12 at this size; software never receives the NVENC-only row/tile packing.
+    double scale = std::min(1.0, std::min(1920.0 / configuration.width, 1080.0 / configuration.height));
+    configuration.width = std::max(2u, (uint32_t)(configuration.width * scale) & ~1u);
+    configuration.height = std::max(2u, (uint32_t)(configuration.height * scale) & ~1u);
+    configuration.codedHeight = configuration.height;
+    configuration.layoutWorkaround = false;
+    configuration.fps = 30;
+    NSDictionary *spec = @{
+        (__bridge NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @NO,
+        (__bridge NSString *)kVTVideoEncoderSpecification_EncoderID: @"com.apple.videotoolbox.videoencoder.h264" };
+    NSDictionary *attrs = @{
+        (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+        (__bridge NSString *)kCVPixelBufferWidthKey: @(configuration.width),
+        (__bridge NSString *)kCVPixelBufferHeightKey: @(configuration.height),
+        (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+    OSStatus software = VTCompressionSessionCreate(kCFAllocatorDefault, configuration.width, configuration.height,
+        kCMVideoCodecType_H264, (__bridge CFDictionaryRef)spec, (__bridge CFDictionaryRef)attrs,
+        nullptr, callback, context, session);
+    if (software == noErr && *session) software = ConfigureEncoder(*session, false, configuration.fps);
+    if (software != noErr || !*session) {
+        Log(@"Apple software H264 create/configure failed status=%d", (int)software);
+        discard(); return software != noErr ? software : paramErr;
+    }
+    configuration.mode = H264EncoderMode::AppleSoftware;
+    Log(@"Apple software H264 ready %ux%u %u fps; NV12 source layout preserved",
+        configuration.width, configuration.height, configuration.fps);
+    return noErr;
+}
+static OSStatus SubmitH264Frame(VTCompressionSessionRef session, H264EncoderMode mode,
+    CVPixelBufferRef frame, CMTime pts, CMTime duration, CFDictionaryRef options,
+    void *frameContext, OSStatus *drainStatus) {
+    *drainStatus = noErr;
+    OSStatus encoded = VTCompressionSessionEncodeFrame(session, frame, pts, duration, options, frameContext, nullptr);
+    // Apple's software encoder rejects MaxFrameDelayCount and can buffer the
+    // first frame despite RealTime/NoBFrames. Complete the submitted timestamp
+    // before waiting on our single-inflight gate. The session remains reusable.
+    if (encoded == noErr && mode == H264EncoderMode::AppleSoftware)
+        *drainStatus = VTCompressionSessionCompleteFrames(session, pts);
+    return encoded;
+}
 static bool PrepackNV12(CVPixelBufferRef source,CVPixelBufferRef target,uint32_t width,uint32_t visibleHeight,uint32_t codedHeight) {
     if(source==target||CVPixelBufferGetPixelFormatType(source)!=kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange||
        CVPixelBufferGetPixelFormatType(target)!=kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange||
@@ -239,6 +330,66 @@ struct FrameMeta {
     uint32_t width, height;
     ~FrameMeta() {if(pixel)CVPixelBufferRelease(pixel);}
 };
+// One state per VT session. A callback from a retiring session must never
+// decrement the replacement session's single-inflight gate.
+struct EncoderFlightState : std::enable_shared_from_this<EncoderFlightState> {
+    explicit EncoderFlightState(void *value=nullptr):owner(value) {}
+    void *owner;
+    std::atomic<int> inflight{0};
+    std::mutex pendingLock;
+    std::map<FrameMeta *,std::unique_ptr<FrameMeta>> pending;
+    bool retired=false;
+    FrameMeta *Track(std::unique_ptr<FrameMeta> meta) {
+        std::lock_guard lock(pendingLock);
+        if(retired)return nullptr;
+        auto key=meta.get();pending.emplace(key,std::move(meta));inflight.fetch_add(1);
+        return key;
+    }
+    std::unique_ptr<FrameMeta> Take(FrameMeta *key) {
+        std::lock_guard lock(pendingLock);
+        auto found=pending.find(key);if(found==pending.end())return {};
+        auto meta=std::move(found->second);pending.erase(found);return meta;
+    }
+    void Reject(FrameMeta *key) {
+        auto meta=Take(key);
+        if(meta)inflight.fetch_sub(1); // A synchronous callback may already own it.
+    }
+    void Retire() {
+        std::map<FrameMeta *,std::unique_ptr<FrameMeta>> abandoned;
+        { std::lock_guard lock(pendingLock);
+          retired=true;abandoned.swap(pending);inflight.fetch_sub((int)abandoned.size()); }
+        // Release retained source buffers outside the ownership lock.
+    }
+};
+static void RetireEncoder(VTCompressionSessionRef& session,std::shared_ptr<EncoderFlightState>& flight) {
+    if(session) {
+        VTCompressionSessionCompleteFrames(session,kCMTimeInvalid);
+        // Invalidation provides VT's orderly teardown before reclaiming frame
+        // contexts for which a failed drain did not deliver a callback.
+        VTCompressionSessionInvalidate(session);CFRelease(session);session=nullptr;
+    }
+    if(flight) { flight->Retire();flight.reset(); }
+}
+static bool EncoderFlightSelfTest() {
+    auto old=std::make_shared<EncoderFlightState>(),replacement=std::make_shared<EncoderFlightState>();
+    auto make=[] {return std::unique_ptr<FrameMeta>(new FrameMeta{0,0,nullptr,0,64,64});};
+    auto activeKey=old->Track(make());auto abandonedKey=old->Track(make());
+    if(old->inflight.load()!=2)return false;
+    auto active=old->Take(activeKey);if(!active)return false;
+    // Simulate an unsuccessful drain: one callback is active, one never arrived.
+    old->Retire();
+    if(old->inflight.load()!=1||old->Take(abandonedKey)||old->Track(make()))return false;
+    auto replacementKey=replacement->Track(make());
+    old->inflight.fetch_sub(1);active.reset();
+    if(old->inflight.load()!=0||replacement->inflight.load()!=1)return false;
+    // A callback that already took ownership makes a rejected submission a no-op.
+    auto completed=replacement->Take(replacementKey);
+    if(!completed)return false;
+    replacement->Reject(replacementKey);
+    if(replacement->inflight.load()!=1)return false;
+    replacement->inflight.fetch_sub(1);completed.reset();replacement->Retire();
+    return replacement->inflight.load()==0;
+}
 struct QueuedInput { RemoteInputEvent event; std::vector<uint8_t> text; };
 
 @interface RemoteHost : NSObject <NSApplicationDelegate, SCStreamOutput, SCStreamDelegate, NSTableViewDataSource, NSTableViewDelegate> {
@@ -246,7 +397,7 @@ struct QueuedInput { RemoteInputEvent event; std::vector<uint8_t> text; };
     remote_endpoint *_endpoint;
     VTCompressionSessionRef _encoder;
     std::atomic<bool> _running, _forceKeyframe;
-    std::atomic<int> _inflight;
+    std::shared_ptr<EncoderFlightState> _encoderFlight;
     std::atomic<uint64_t> _captured, _encoded, _dropped, _encodedBytes, _encodeFailures;
     std::atomic<int> _connection;
     std::mutex _encoderLock;
@@ -285,6 +436,12 @@ struct QueuedInput { RemoteInputEvent event; std::vector<uint8_t> text; };
     NSString *_token, *_identity, *_bind;
     uint32_t _width, _height, _codedHeight;
     bool _layoutWorkaround;
+    uint32_t _encoderFps;
+    NSString *_encoderID;
+    std::atomic<H264EncoderMode> _encoderMode;
+    std::atomic<unsigned> _consecutiveEncodeFailures;
+    std::atomic<bool> _encoderRecoveryScheduled;
+    BOOL _forceSoftwareCapture;
     CGRect _displayBounds;
     NSWindow *_window;
     RemoteHostPanel *_hostPanel;
@@ -307,6 +464,8 @@ struct QueuedInput { RemoteInputEvent event; std::vector<uint8_t> text; };
 - (void)probeCursor;
 - (void)startCapture;
 - (void)stopCapture;
+- (NSString *)encoderStreamingStatus;
+- (void)encoderFailed:(OSStatus)status epoch:(uint64_t)epoch immediately:(BOOL)immediately;
 - (uint64_t)invalidateCaptureSourceLocked;
 - (void)captureFailed:(NSError *)error stage:(NSString *)stage;
 - (void)captureFrameStatus:(SCFrameStatus)status stream:(SCStream *)stream;
@@ -328,17 +487,20 @@ struct QueuedInput { RemoteInputEvent event; std::vector<uint8_t> text; };
 
 static void EncodedCallback(void *context, void *frameContext, OSStatus status,
                             VTEncodeInfoFlags flags, CMSampleBufferRef sample) {
-    RemoteHost *host = (__bridge RemoteHost *)context;
-    struct CallbackDone {RemoteHost *host;~CallbackDone(){host->_inflight.fetch_sub(1);}} done{host};
-    std::unique_ptr<FrameMeta> meta((FrameMeta *)frameContext);
-    if (!meta || meta->captureEpoch != host->_frameEpoch.load() || !host->_captureActive.load()) return;
+    auto flight=((EncoderFlightState *)context)->shared_from_this();
+    auto meta=flight->Take((FrameMeta *)frameContext);
+    if(!meta)return; // Retired/rejected contexts cannot be completed twice.
+    struct CallbackDone {std::shared_ptr<EncoderFlightState> flight;~CallbackDone(){flight->inflight.fetch_sub(1);}} done{flight};
+    RemoteHost *host = (__bridge RemoteHost *)flight->owner;
+    if (meta->captureEpoch != host->_frameEpoch.load() || !host->_captureActive.load()) return;
     if (status != noErr || !sample) {
         host->_encodeFailures.fetch_add(1);
         Log(@"VT callback status=%d dropped=%d", (int)status, !!(flags & kVTEncodeInfo_FrameDropped));
+        [host encoderFailed:status != noErr ? status : paramErr epoch:meta->captureEpoch immediately:NO];
         return;
     }
     std::vector<uint8_t> packet(sizeof(RemoteFrameHeader)); bool idr = false;
-    if (!AnnexB(sample, packet, idr)) { host->_encodeFailures.fetch_add(1); return; }
+    if (!AnnexB(sample, packet, idr)) { host->_encodeFailures.fetch_add(1); [host encoderFailed:paramErr epoch:meta->captureEpoch immediately:NO]; return; }
     if(packet.size()>8*1024*1024) { host->_encodeFailures.fetch_add(1); host->_forceKeyframe.store(true); return; }
     RemoteFrameHeader header = {0x31524652, meta->width, meta->height, idr ? 1u : 0u,
         meta ? meta->sequence : 0, meta ? meta->capturedUs : 0};
@@ -347,6 +509,7 @@ static void EncodedCallback(void *context, void *frameContext, OSStatus status,
     // with lifecycle invalidation, rather than relying on the entry check.
     std::lock_guard captureLock(host->_captureLock);
     if(meta->captureEpoch!=host->_frameEpoch.load() || !host->_captureActive.load() || !host->_captureSource.load()) return;
+    host->_consecutiveEncodeFailures.store(0);
     host->_encoded.fetch_add(1); host->_encodedBytes.fetch_add(packet.size());
     int result = remote_send(host->_endpoint, REMOTE_VIDEO, packet.data(), packet.size());
     if (result < 0) host->_forceKeyframe.store(true);
@@ -415,13 +578,16 @@ static CGEventFlags ModifierFlag(int key) {
     _requestPermissionsOnLaunch = request;
     _backgroundLaunch = background;
     _postAllowed=CGPreflightPostEventAccess();
-    _running.store(true); _forceKeyframe.store(true); _inflight.store(0); _connection.store(0);
+    _running.store(true); _forceKeyframe.store(true); _connection.store(0);
     _captured.store(0); _encoded.store(0); _dropped.store(0); _encodedBytes.store(0); _encodeFailures.store(0);
     _encoder = nullptr; _endpoint = nullptr;
     _captureEpoch.store(1); _frameEpoch.store(1); _captureSource.store(nullptr);
     _captureActive.store(false); _captureFrameState.store(SCFrameStatusStopped);
     _captureState = @"idle";
     _width = 1920; _height = 1080; _displayBounds = CGDisplayBounds(CGMainDisplayID());
+    _encoderFps = 60; _encoderID = @""; _encoderMode.store(H264EncoderMode::Unavailable);
+    _consecutiveEncodeFailures.store(0); _encoderRecoveryScheduled.store(false);
+    _forceSoftwareCapture = ForceSoftwareH264();
     _lastPoint = CGPointMake(CGRectGetMidX(_displayBounds), CGRectGetMidY(_displayBounds));
     _modifiers = 0; _hasSequence = false; _lastSequence = 0;
     for (int i=0;i<3;++i) _buttons[i] = false;
@@ -573,11 +739,12 @@ static CGEventFlags ModifierFlag(int key) {
     });
     _encodeThread = std::thread([self] {
         while (self->_running.load()) {
-            if (self->_connection.load() != 1 || self->_inflight.load() >= 1) {
+            if (self->_connection.load() != 1) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue;
             }
             std::unique_lock<std::mutex> encoderLock(self->_encoderLock);
-            if (!self->_encoder) { encoderLock.unlock(); std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
+            auto flight=self->_encoderFlight;
+            if (!self->_encoder || !flight || flight->inflight.load()>=1) { encoderLock.unlock(); std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
             CVPixelBufferRef frame = nullptr; CMTime pts = kCMTimeInvalid; uint64_t captured = 0;
             uint64_t epoch = 0;
             { std::lock_guard captureLock(self->_captureLock);
@@ -596,16 +763,26 @@ static CGEventFlags ModifierFlag(int key) {
             }
             // Keep the input surface alive until its encoder callback finishes.
             // Experimental NVENC does not reliably retain pooled source buffers.
-            auto meta = new FrameMeta { self->_captured.fetch_add(1)+1, captured, frame, epoch, self->_width, self->_height };
-            self->_inflight.fetch_add(1);
+            auto meta = flight->Track(std::unique_ptr<FrameMeta>(new FrameMeta{
+                self->_captured.fetch_add(1)+1, captured, frame, epoch, self->_width, self->_height}));
+            if(!meta)continue;
             CFDictionaryRef options = nullptr;
             bool force = self->_forceKeyframe.exchange(false);
             if (force) options = (__bridge CFDictionaryRef)@{(__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame:@YES};
-            OSStatus result = VTCompressionSessionEncodeFrame(self->_encoder,frame,pts,CMTimeMake(1,60),options,meta,nullptr);
+            OSStatus drainStatus = noErr;
+            OSStatus result = SubmitH264Frame(self->_encoder,self->_encoderMode.load(),frame,pts,
+                CMTimeMake(1,self->_encoderFps),options,meta,&drainStatus);
             encoderLock.unlock();
             if (result != noErr) {
-                delete meta; self->_inflight.fetch_sub(1); self->_encodeFailures.fetch_add(1);
+                flight->Reject(meta); self->_encodeFailures.fetch_add(1);
                 self->_forceKeyframe.store(true); Log(@"VT encode status=%d",(int)result);
+                [self encoderFailed:result epoch:epoch immediately:NO];
+            } else if (drainStatus != noErr) {
+                // A failed drain may still own the frame context. Stop/invalidate
+                // through the lifecycle gate; do not free callback-owned memory.
+                self->_encodeFailures.fetch_add(1);self->_forceKeyframe.store(true);
+                Log(@"Apple software H264 frame completion failed status=%d",(int)drainStatus);
+                [self encoderFailed:drainStatus epoch:epoch immediately:YES];
             }
         }
     });
@@ -631,7 +808,8 @@ static CGEventFlags ModifierFlag(int key) {
         NSDictionary *status = @{ @"type":@"host-status", @"message":message,
             @"capture_state":_captureState ?: @"idle", @"capture_message":_captureStatus ?: @"",
             @"cursor":_cursorBaked ? @"video-compatibility" : @"local",
-            @"width":@(_width), @"height":@(_height), @"fps":@60,
+            @"width":@(_width), @"height":@(_height), @"fps":@(_encoderFps),
+            @"encoder_mode":EncoderModeName(_encoderMode.load()), @"encoder_id":_encoderID ?: @"",
             @"coded_height":@(_codedHeight), @"nvenc_layout_workaround":@(_layoutWorkaround),
             @"captured":@(_captured.load()), @"encoded":@(_encoded.load()),
             @"dropped":@(_dropped.load()), @"encoded_bytes":@(_encodedBytes.load()),
@@ -820,6 +998,7 @@ static CGEventFlags ModifierFlag(int key) {
 }
 - (void)restartCapture {
     _captureBlocked=NO; _captureRetryAt=0; _captureRetryAttempt=0;
+    _forceSoftwareCapture=ForceSoftwareH264();
     _captureState=@"recovering"; _captureStatus=@"正在重新建立画面采集…";
     _restartAfterStop=YES;
     [self stopCapture];
@@ -847,7 +1026,7 @@ static CGEventFlags ModifierFlag(int key) {
         _postAllowed=allowed;
         if (!_capturing && !_starting && !_stopping && !_captureBlocked &&
             now>=_captureRetryAt && CGPreflightScreenCaptureAccess()) [self startCapture];
-        if (_connection.load() == 1) [self sendStatus:_captureStatus ?: (_capturing ? @"Streaming H.264 hardware" : @"Waiting for screen permission/capture")];
+        if (_connection.load() == 1) [self sendStatus:_captureStatus ?: (_capturing ? [self encoderStreamingStatus] : @"Waiting for screen permission/capture")];
     }
     char fingerprint[256] = {};
     if (_endpoint) remote_fingerprint(_endpoint,fingerprint,sizeof(fingerprint));
@@ -919,18 +1098,23 @@ static CGEventFlags ModifierFlag(int key) {
             self->_displayBounds=CGDisplayBounds(self->_display.displayID);
             InitializeHardwareVideo();
             std::unique_lock<std::mutex> encoderLock(self->_encoderLock);
-            if(self->_encoder) { VTCompressionSessionCompleteFrames(self->_encoder,kCMTimeInvalid);
-                VTCompressionSessionInvalidate(self->_encoder); CFRelease(self->_encoder); self->_encoder=nullptr; }
-            OSStatus created=CreateHardwareEncoder(self->_width,self->_height,EncodedCallback,(__bridge void *)self,
-                &self->_encoder,&self->_codedHeight,&self->_layoutWorkaround);
-            Log(@"VT create RequireHardware H264 visible=%u x %u coded-height=%u status=%d",self->_width,self->_height,self->_codedHeight,(int)created);
-            if(created!=noErr || !self->_encoder) { encoderLock.unlock(); self->_captureState=@"failed"; self->_captureStatus=@"H.264 硬件编码器启动失败，请点重试画面采集。"; self->_captureBlocked=YES; [self stopCapture]; [self sendStatus:self->_captureStatus]; return; }
-            if(ConfigureEncoder(self->_encoder)!=noErr) { encoderLock.unlock(); self->_captureState=@"failed"; self->_captureStatus=@"H.264 硬件编码器准备失败，请点重试画面采集。"; self->_captureBlocked=YES; [self stopCapture]; [self sendStatus:self->_captureStatus]; return; }
+            RetireEncoder(self->_encoder,self->_encoderFlight);
+            self->_encoderFlight=std::make_shared<EncoderFlightState>((__bridge void *)self);
+            H264EncoderConfiguration encoder{self->_width,self->_height};
+            OSStatus created=CreateStreamingEncoder(encoder,EncodedCallback,self->_encoderFlight.get(),
+                &self->_encoder,self->_forceSoftwareCapture);
+            self->_width=encoder.width;self->_height=encoder.height;self->_codedHeight=encoder.codedHeight;
+            self->_layoutWorkaround=encoder.layoutWorkaround;self->_encoderFps=encoder.fps;
+            self->_encoderMode.store(encoder.mode);self->_encoderID=self->_encoder?EncoderID(self->_encoder):@"";
+            self->_consecutiveEncodeFailures.store(0);self->_encoderRecoveryScheduled.store(false);
+            Log(@"VT H264 mode=%@ encoder=%@ visible=%ux%u coded-height=%u fps=%u status=%d",
+                EncoderModeName(encoder.mode),self->_encoderID,self->_width,self->_height,self->_codedHeight,self->_encoderFps,(int)created);
+            if(created!=noErr || !self->_encoder) { encoderLock.unlock(); self->_captureState=@"failed"; self->_captureStatus=@"H.264 硬件及 Apple 软件编码器均不可用，请查看诊断日志并重试画面采集。"; self->_captureBlocked=YES; [self stopCapture]; [self sendStatus:self->_captureStatus]; return; }
             encoderLock.unlock();
             self->_configuration=[SCStreamConfiguration new];
             self->_configuration.width=self->_width; self->_configuration.height=self->_height;
             self->_configuration.pixelFormat=kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-            self->_configuration.queueDepth=3; self->_configuration.minimumFrameInterval=CMTimeMake(1,60);
+            self->_configuration.queueDepth=3; self->_configuration.minimumFrameInterval=CMTimeMake(1,self->_encoderFps);
             self->_configuration.showsCursor=self->_cursorBaked;
             self->_configuration.capturesAudio=NO;
             SCContentFilter *filter=[[SCContentFilter alloc] initWithDisplay:self->_display excludingWindows:@[]];
@@ -951,7 +1135,7 @@ static CGEventFlags ModifierFlag(int key) {
                     self->_starting=NO; self->_capturing=YES; self->_captureBlocked=NO;
                     self->_captureRetryAt=0; self->_forceKeyframe.store(true);
                     [self captureFrameStatus:(SCFrameStatus)self->_captureFrameState.load() stream:newStream];
-                    [self sendStatus:self->_captureStatus ?: @"ScreenCaptureKit NV12 hardware H.264 running"];
+                    [self sendStatus:self->_captureStatus ?: [self encoderStreamingStatus]];
                 });
             }];
         });
@@ -989,6 +1173,33 @@ static CGEventFlags ModifierFlag(int key) {
         [self captureFailed:error stage:@"Capture stopped"];
     });
 }
+- (NSString *)encoderStreamingStatus {
+    return _encoderMode.load() == H264EncoderMode::AppleSoftware ?
+        @"正在通过 Apple 软件 H.264 编码传送画面（最高 1080p / 30 fps），CPU 负载较高。" :
+        @"正在通过 H.264 硬件编码传送画面。";
+}
+- (void)encoderFailed:(OSStatus)status epoch:(uint64_t)epoch immediately:(BOOL)immediately {
+    // One dropped frame is not an encoder failure. Repeated production failures
+    // trigger a single lifecycle transition on the main queue, never in a VT callback.
+    unsigned failures=_consecutiveEncodeFailures.fetch_add(1)+1;
+    if ((!immediately && failures < 3) || _encoderRecoveryScheduled.exchange(true)) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if(epoch!=self->_frameEpoch.load() || !self->_running.load()) { self->_encoderRecoveryScheduled.store(false); return; }
+        H264EncoderMode mode=self->_encoderMode.load();
+        Log(@"Repeated H264 encode failures mode=%@ status=%d",EncoderModeName(mode),(int)status);
+        if(mode==H264EncoderMode::Hardware) {
+            self->_forceSoftwareCapture=YES;self->_captureBlocked=NO;
+            self->_captureState=@"recovering";self->_captureStatus=@"H.264 硬件编码中断，正在切换到 Apple 软件编码…";
+            self->_restartAfterStop=YES;
+            [self stopCapture];[self sendStatus:self->_captureStatus];
+            if(!self->_stopping){self->_restartAfterStop=NO;[self startCapture];}
+        } else if(mode==H264EncoderMode::AppleSoftware) {
+            self->_captureState=@"failed";self->_captureStatus=@"Apple 软件 H.264 编码连续失败，请查看诊断日志并重试画面采集。";
+            self->_captureBlocked=YES;self->_restartAfterStop=NO;
+            [self stopCapture];[self sendStatus:self->_captureStatus];
+        }
+    });
+}
 - (void)stopCapture {
     if(_stopping) return;
     uint64_t epoch;
@@ -996,7 +1207,8 @@ static CGEventFlags ModifierFlag(int key) {
     // VT drain can synchronously invoke EncodedCallback. Never hold captureLock
     // while taking/draining the encoder; that callback needs the lifecycle gate.
     { std::lock_guard lock(_encoderLock);
-      if(_encoder) { VTCompressionSessionCompleteFrames(_encoder,kCMTimeInvalid); VTCompressionSessionInvalidate(_encoder); CFRelease(_encoder); _encoder=nullptr; } }
+      RetireEncoder(_encoder,_encoderFlight);
+      _encoderMode.store(H264EncoderMode::Unavailable); _encoderID=@""; }
     SCStream *oldStream=_stream; _stream=nil; _configuration=nil;
     _stopping=oldStream!=nil;
     _captureStopDeadline=NowUs()+5000000;
@@ -1053,7 +1265,7 @@ static CGEventFlags ModifierFlag(int key) {
     }
     if(![before isEqualToString:_captureState]) {
         if(!_captureActive.load()) [self releaseAll];
-        [self sendStatus:_captureStatus ?: @"Streaming H.264 hardware"];
+        [self sendStatus:_captureStatus ?: [self encoderStreamingStatus]];
     }
 }
 - (void)handleInputs:(std::vector<QueuedInput>)inputs {
@@ -1158,7 +1370,7 @@ static CGEventFlags ModifierFlag(int key) {
     _restart.reset(); // Cancel any unapproved authorization before closing its transport.
     if(_bulkThread.joinable())_bulkThread.join();
     if(_encodeThread.joinable())_encodeThread.join();
-    if(_encoder) { VTCompressionSessionCompleteFrames(_encoder,kCMTimeInvalid); VTCompressionSessionInvalidate(_encoder); CFRelease(_encoder); _encoder=nullptr; }
+    RetireEncoder(_encoder,_encoderFlight);
     _captureFrames.Reset(0);
     _nativeExchange.reset(); _exchange.reset();
     if(_endpoint) {remote_close(_endpoint);_endpoint=nullptr;}
@@ -1203,10 +1415,12 @@ static void SelfTestCallback(void *context,void *source,OSStatus result,VTEncode
 static const int TestY[8]={210,180,160,130,110,80,40,24};
 static const int TestU[8]={128,40,160,60,196,90,224,128};
 static const int TestV[8]={128,140,40,60,196,224,110,128};
+static constexpr int CodecSelfTestFrames=30, CodecSelfTestMarkerStart=1244;
 struct DecodeTest {
     std::atomic<int> frames{0},errors{0},badSamples{0},markerFailures{0};
     std::atomic<uint64_t> lumaError{0},chromaError{0},lumaSamples{0},chromaSamples{0};
     uint32_t expectedHeight=1080;
+    uint32_t fps=60;
     std::atomic<int> denseChromaBad{0},denseChromaMax{0};
     std::atomic<uint64_t> denseChromaError{0},denseChromaSamples{0};
     struct Record { int sourceIndex,ptsIndex,markerLuma,strongestMarker,strongestLuma,bar0Luma,bar6Luma; };
@@ -1237,13 +1451,13 @@ static void SelfDecodeCallback(void *context,void *source,OSStatus status,VTDeco
         CheckPixel(test,uv[(row/2)*uvs+(x&~1)],TestU[bar],true);
         CheckPixel(test,uv[(row/2)*uvs+(x&~1)+1],TestV[bar],true);
     }
-    // A white marker changes location every frame within the blue bar. This catches
+    // A white marker changes location every frame within the right-hand bars. This catches
     // repeated/stale pictures that a smooth average-luma comparison would miss.
-    int marker=1450+*frame*20;
+    int marker=CodecSelfTestMarkerStart+6+*frame*20;
     int markerError=std::abs((int)y[48*ys+marker]-235);
     int strongest=-1,strongestLuma=-1;
-    for(int i=0;i<12;++i) {int luma=y[48*ys+1450+i*20];if(luma>strongestLuma) {strongestLuma=luma;strongest=i;}}
-    int ptsIndex=CMTIME_IS_NUMERIC(pts)?(int)CMTimeConvertScale(pts,60,kCMTimeRoundingMethod_RoundHalfAwayFromZero).value:-1;
+    for(int i=0;i<CodecSelfTestFrames;++i) {int luma=y[48*ys+CodecSelfTestMarkerStart+6+i*20];if(luma>strongestLuma) {strongestLuma=luma;strongest=i;}}
+    int ptsIndex=CMTIME_IS_NUMERIC(pts)?(int)CMTimeConvertScale(pts,test->fps,kCMTimeRoundingMethod_RoundHalfAwayFromZero).value:-1;
     {std::lock_guard<std::mutex> lock(test->mutex);test->records.push_back({*frame,ptsIndex,
         (int)y[48*ys+marker],strongest,strongestLuma,(int)y[540*ys+120],(int)y[540*ys+1560]});}
     if(markerError>20)test->markerFailures.fetch_add(1);
@@ -1253,7 +1467,7 @@ static void SelfDecodeCallback(void *context,void *source,OSStatus status,VTDeco
     // Dense chroma grid and every final visible UV row catch partial last-tile
     // uploads. Preserve the original color and moving-marker checks above.
     auto chromaRow=[&](int row) {
-        const int start=1444+*frame*20;
+        const int start=CodecSelfTestMarkerStart+*frame*20;
         for(int x=6;x<1918;x+=14) {
             if(row>=12&&row<36&&x>=start-8&&x<start+20)continue;
             const int expected[2]={TestU[x/240],TestV[x/240]};
@@ -1270,10 +1484,10 @@ static void SelfDecodeCallback(void *context,void *source,OSStatus status,VTDeco
     for(int row=536;row<540;++row)chromaRow(row);
     CVPixelBufferUnlockBaseAddress(image,kCVPixelBufferLock_ReadOnly);test->frames.fetch_add(1);
 }
-static NSDictionary *DecodeSelfSamples(SelfTest& encoded,uint32_t codedHeight=1080) {
+static NSDictionary *DecodeSelfSamples(SelfTest& encoded,uint32_t codedHeight=1080,uint32_t fps=60) {
     if(encoded.samples.empty())return @{@"pass":@NO,@"error":@"No encoded samples"};
     std::sort(encoded.samples.begin(),encoded.samples.end(),[](const SelfSample& a,const SelfSample& b){return a.index<b.index;});
-    DecodeTest test;test.expectedHeight=codedHeight;VTDecompressionSessionRef decoder=nullptr;
+    DecodeTest test;test.expectedHeight=codedHeight;test.fps=fps;VTDecompressionSessionRef decoder=nullptr;
     VTDecompressionOutputCallbackRecord callback={SelfDecodeCallback,&test};
     NSDictionary *spec=@{(__bridge NSString *)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder:@NO};
     NSDictionary *attrs=@{(__bridge NSString *)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)};
@@ -1293,7 +1507,7 @@ static NSDictionary *DecodeSelfSamples(SelfTest& encoded,uint32_t codedHeight=10
     VTDecompressionSessionInvalidate(decoder);CFRelease(decoder);
     double luma=test.lumaSamples.load()?(double)test.lumaError.load()/test.lumaSamples.load():999;
     double chroma=test.chromaSamples.load()?(double)test.chromaError.load()/test.chromaSamples.load():999;
-    bool pass=test.frames.load()==12&&!test.errors.load()&&!test.badSamples.load()&&!test.markerFailures.load()&&!test.denseChromaBad.load()&&
+    bool pass=test.frames.load()==CodecSelfTestFrames&&!test.errors.load()&&!test.badSamples.load()&&!test.markerFailures.load()&&!test.denseChromaBad.load()&&
         finish==noErr&&waited==noErr&&luma<12&&chroma<12&&!(hardwareStatus==noErr&&hardwareUsed);
     NSMutableArray *records=[NSMutableArray array];
     std::sort(test.records.begin(),test.records.end(),[](const auto& a,const auto& b){return a.sourceIndex<b.sourceIndex;});
@@ -1308,25 +1522,68 @@ static NSDictionary *DecodeSelfSamples(SelfTest& encoded,uint32_t codedHeight=10
         @"dense_chroma_mean_error":@(test.denseChromaSamples.load()?(double)test.denseChromaError.load()/test.denseChromaSamples.load():999),
         @"dense_chroma_samples":@(test.denseChromaSamples.load()),@"dense_chroma_bad_coordinates":bad};
 }
+static bool ExportCodecTestFrames(SelfTest& test, NSString *path, uint32_t width, uint32_t height,
+                                 uint32_t fps, uint64_t *bytesWritten, NSString **error) {
+    static_assert(sizeof(RemoteFrameHeader) == 32);
+    *bytesWritten = 0;
+    if (test.samples.empty()) { *error = @"no_encoded_samples"; return false; }
+    std::sort(test.samples.begin(), test.samples.end(), [](const SelfSample& a, const SelfSample& b) { return a.index < b.index; });
+    NSMutableData *records = [NSMutableData data];
+    for (const SelfSample& sample : test.samples) {
+        std::vector<uint8_t> payload; bool idr = false;
+        if (!AnnexB(sample.sample, payload, idr)) { *error = @"annex_b_conversion_failed"; return false; }
+        const size_t recordSize = sizeof(RemoteFrameHeader) + payload.size();
+        if (payload.empty() || recordSize > 8U * 1024 * 1024) { *error = @"record_length_out_of_range"; return false; }
+        if (records.length + 4 + recordSize > 64ULL * 1024 * 1024) { *error = @"fixture_size_out_of_range"; return false; }
+        const uint32_t length = (uint32_t)recordSize;
+        const uint8_t lengthBytes[4] = {(uint8_t)length, (uint8_t)(length >> 8), (uint8_t)(length >> 16), (uint8_t)(length >> 24)};
+        RemoteFrameHeader header = {0x31524652, width, height, idr ? 1u : 0u,
+            (uint64_t)sample.index + 1, (uint64_t)sample.index * 1000000 / fps};
+        // decode-smoke reads a little-endian record length, then the exact
+        // production 32-byte header and Annex B payload. There is no file preamble.
+        [records appendBytes:lengthBytes length:sizeof(lengthBytes)];
+        [records appendBytes:&header length:sizeof(header)];
+        [records appendBytes:payload.data() length:payload.size()];
+    }
+    // The existing private-file writer uses a 0600 temporary file, fsync and
+    // atomic rename. Callers provide an existing private test directory.
+    if (!WritePrivateData(path, records)) { *error = @"fixture_write_failed"; return false; }
+    *bytesWritten = records.length;
+    return true;
+}
 static int CodecSelfTest() {
     InitializeHardwareVideo();
     SelfTest test;VTCompressionSessionRef session=nullptr;
-    NSMutableDictionary *report=[@{@"codec":@"h264",@"width":@1920,@"height":@1080,@"fps":@60,@"require_hardware":@YES,
-        @"pass":@NO,@"scope":@"12-frame 1080p encoder, forced IDR, software-decoded color/position test; sustained streaming and latency require separate verification"} mutableCopy];
+    bool ownershipPass=EncoderFlightSelfTest();
+    NSMutableDictionary *report=[@{@"codec":@"h264",@"width":@1920,@"height":@1080,
+        @"encoder_flight_ownership_pass":@(ownershipPass),
+        @"pass":@NO,@"scope":@"30-frame production encoder selection/configuration, forced IDR, software-decoded NV12 color/position test; sustained streaming and latency require separate verification"} mutableCopy];
+    const char *fixtureEnvironment = getenv("GLIDEBEAM_CODEC_TEST_FRAMES");
+    NSString *fixturePath = fixtureEnvironment && *fixtureEnvironment ? [NSString stringWithUTF8String:fixtureEnvironment] : nil;
+    if (fixtureEnvironment && *fixtureEnvironment) {
+        report[@"fixture_written"] = @NO;
+        report[@"fixture_path"] = fixturePath ?: @"";
+        if (!fixturePath.length) { report[@"fixture_error"] = @"invalid_utf8_fixture_path"; PrintJson(report); return 5; }
+    }
     NSDictionary *attrs=@{(__bridge NSString *)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
         (__bridge NSString *)kCVPixelBufferWidthKey:@1920,(__bridge NSString *)kCVPixelBufferHeightKey:@1080,
         (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey:@{}};
-    uint32_t codedHeight=1080;bool layoutWorkaround=false;
-    OSStatus created=CreateHardwareEncoder(1920,1080,SelfTestCallback,&test,&session,&codedHeight,&layoutWorkaround);
+    H264EncoderConfiguration encoder{1920,1080};
+    OSStatus created=CreateStreamingEncoder(encoder,SelfTestCallback,&test,&session,ForceSoftwareH264());
+    uint32_t codedHeight=encoder.codedHeight;bool layoutWorkaround=encoder.layoutWorkaround;
     report[@"coded_height"]=@(codedHeight);report[@"nvenc_layout_workaround"]=@(layoutWorkaround);
-    report[@"create_status"]=@(created);Log(@"Self-test VT create RequireHardware NV12 status=%d",(int)created);
+    report[@"encoder_mode"]=EncoderModeName(encoder.mode);report[@"fps"]=@(encoder.fps);
+    report[@"require_hardware"]=@(encoder.mode==H264EncoderMode::Hardware);
+    report[@"encoder_id"]=session?EncoderID(session):@"";
+    report[@"create_status"]=@(created);Log(@"Self-test production H264 mode=%@ status=%d",EncoderModeName(encoder.mode),(int)created);
     if(created!=noErr || !session) {PrintJson(report);return 2;}
-    OSStatus prepare=ConfigureEncoder(session);report[@"prepare_status"]=@(prepare);
-    if(prepare!=noErr) {VTCompressionSessionInvalidate(session);CFRelease(session);PrintJson(report);return 3;}
+    report[@"prepare_status"]=@0; // The production creation helper already prepared and verified this session.
     CFTypeRef hardware=nullptr;
     OSStatus hardwareStatus=VTSessionCopyProperty(session,kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,nullptr,&hardware);
     bool hardwareUsed=hardware==kCFBooleanTrue;if(hardware)CFRelease(hardware);
-    for(int frame=0;frame<12;++frame) {
+    uint64_t encodeStarted=NowUs();
+    bool singleInflightSoftwarePass=true;
+    for(int frame=0;frame<CodecSelfTestFrames;++frame) {
         CVPixelBufferRef pixel=nullptr;
         OSStatus allocated=layoutWorkaround?CVPixelBufferCreate(kCFAllocatorDefault,1920,1080,kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,(__bridge CFDictionaryRef)attrs,&pixel):
             CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault,VTCompressionSessionGetPixelBufferPool(session),&pixel);
@@ -1334,7 +1591,7 @@ static int CodecSelfTest() {
         CVPixelBufferLockBaseAddress(pixel,0);
         uint8_t *y=(uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pixel,0),*uv=(uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pixel,1);
         size_t ys=CVPixelBufferGetBytesPerRowOfPlane(pixel,0),uvs=CVPixelBufferGetBytesPerRowOfPlane(pixel,1);
-        int offset=(frame%3)*12,marker=1444+frame*20;
+        int offset=(frame%3)*12,marker=CodecSelfTestMarkerStart+frame*20;
         for(int row=0;row<1080;++row)for(int bar=0;bar<8;++bar)memset(y+row*ys+bar*240,TestY[bar]+offset,240);
         for(int row=0;row<540;++row)for(int col=0;col<1920;col+=2) {int bar=col/240;uv[row*uvs+col]=TestU[bar];uv[row*uvs+col+1]=TestV[bar];}
         for(int row=32;row<64;++row)memset(y+row*ys+marker,235,12);
@@ -1348,18 +1605,35 @@ static int CodecSelfTest() {
         bool force=frame==6;
         NSDictionary *options=force?@{(__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame:@YES}:nil;
         auto meta=new SelfFrame{frame,force,pixel};
-        OSStatus result=VTCompressionSessionEncodeFrame(session,pixel,CMTimeMake(frame,60),CMTimeMake(1,60),(__bridge CFDictionaryRef)options,meta,nullptr);
+        OSStatus drainStatus=noErr;
+        OSStatus result=SubmitH264Frame(session,encoder.mode,pixel,CMTimeMake(frame,encoder.fps),
+            CMTimeMake(1,encoder.fps),(__bridge CFDictionaryRef)options,meta,&drainStatus);
         if(result!=noErr) {delete meta;test.errors.fetch_add(1);}
-        // The production pipeline permits one frame in flight. Complete this
-        // fixture frame before submitting another source buffer.
-        if(VTCompressionSessionCompleteFrames(session,kCMTimeInvalid)!=noErr)test.errors.fetch_add(1);
+        if(encoder.mode==H264EncoderMode::AppleSoftware) {
+            // This assertion precedes any final drain: a buffered first frame
+            // would deadlock production's single-inflight gate and must fail here.
+            if(result!=noErr || drainStatus!=noErr || test.frames.load()!=frame+1) {
+                singleInflightSoftwarePass=false;test.errors.fetch_add(1);
+                Log(@"Software single-inflight test failed frame=%d callbacks=%d drain-status=%d",
+                    frame,test.frames.load(),(int)drainStatus);break;
+            }
+        } else if(VTCompressionSessionCompleteFrames(session,kCMTimeInvalid)!=noErr)test.errors.fetch_add(1);
     }
     OSStatus completed=VTCompressionSessionCompleteFrames(session,kCMTimeInvalid);
+    double encodeElapsedMs=(NowUs()-encodeStarted)/1000.0;
     VTCompressionSessionInvalidate(session);CFRelease(session);
-    NSDictionary *decoded=DecodeSelfSamples(test,codedHeight);
-    bool pass=test.frames.load()==12&&test.errors.load()==0&&test.keyframes.load()>=2&&test.forcedIdr.load()==1&&completed==noErr&&[decoded[@"pass"] boolValue];
+    NSDictionary *decoded=DecodeSelfSamples(test,codedHeight,encoder.fps);
+    bool pass=ownershipPass&&test.frames.load()==CodecSelfTestFrames&&test.errors.load()==0&&test.keyframes.load()>=2&&test.forcedIdr.load()==1&&completed==noErr&&[decoded[@"pass"] boolValue];
+    if (fixturePath.length) {
+        uint64_t fixtureBytes = 0; NSString *fixtureError = nil;
+        bool written = ExportCodecTestFrames(test, fixturePath, encoder.width, encoder.height, encoder.fps, &fixtureBytes, &fixtureError);
+        report[@"fixture_written"] = @(written); report[@"fixture_bytes"] = @(fixtureBytes);
+        report[@"fixture_records"] = @(written ? test.samples.size() : 0);
+        if (!written) { report[@"fixture_error"] = fixtureError ?: @"fixture_export_failed"; pass = false; }
+    }
     [report addEntriesFromDictionary:@{@"hardware_query_status":@(hardwareStatus),@"hardware_used":@(hardwareUsed),@"complete_status":@(completed),
-        @"frames":@(test.frames.load()),@"errors":@(test.errors.load()),@"keyframes":@(test.keyframes.load()),@"forced_idr_verified":@(test.forcedIdr.load()==1),
+        @"frames":@(test.frames.load()),@"errors":@(test.errors.load()),@"encode_elapsed_ms":@(encodeElapsedMs),@"keyframes":@(test.keyframes.load()),@"forced_idr_verified":@(test.forcedIdr.load()==1),
+        @"software_single_inflight_pass":encoder.mode==H264EncoderMode::AppleSoftware?@(singleInflightSoftwarePass):[NSNull null],
         @"annex_b_bytes":@(test.bytes.load()),@"decoded_content":decoded,@"pass":@(pass)}];
     PrintJson(report);return pass?0:4;
 }

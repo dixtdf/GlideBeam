@@ -64,9 +64,18 @@ constexpr wchar_t kWindowClass[] = L"RemoteNativeWindow";
 constexpr wchar_t kCanvasClass[] = L"RemoteNativeCanvas";
 constexpr wchar_t kOverlayClass[] = L"RemoteNativeSessionOverlay";
 constexpr float kToolbarWidth = 762.f, kToolbarHeight = 64.f;
-constexpr float kMetricsWidth = 310.f, kMetricsHeight = 300.f;
+constexpr float kMetricsWidth = 400.f, kMetricsHeight = 326.f;
 constexpr float kCaptureNoticeWidth = 480.f, kCaptureNoticeHeight = 172.f;
 constexpr float kNavWidth = 206.f;
+const wchar_t* MacEncoderText(const SessionSnapshot& snapshot) {
+    if (snapshot.state != SessionState::Connected) return L"等待主机报告";
+    switch (snapshot.macEncoderMode) {
+    case MacVideoEncoderMode::Hardware: return L"硬件 H.264";
+    case MacVideoEncoderMode::AppleSoftware: return L"Apple 软件 H.264";
+    case MacVideoEncoderMode::Software: return L"软件 H.264";
+    default: return L"等待主机报告";
+    }
+}
 struct ComApartment {
     HRESULT result = OleInitialize(nullptr);
     ~ComApartment() { if (SUCCEEDED(result)) OleUninitialize(); }
@@ -428,12 +437,12 @@ struct Ui {
         overlay.hits.clear();
         out.Round(0, 0, kMetricsWidth, kMetricsHeight, 11, NAV, LINE);
         out.Text(L"解码与传输", 18, 12, 215, 27, 14, WHITE, true);
-        out.Text(L"\u00d7", 263, 10, 31, 29, 20, MUTED, false, DWRITE_TEXT_ALIGNMENT_CENTER);
-        overlay.hits.push_back({D2D1::RectF(260, 8, 298, 42), Action::Metrics});
+        out.Text(L"\u00d7", kMetricsWidth - 47, 10, 31, 29, 20, MUTED, false, DWRITE_TEXT_ALIGNMENT_CENTER);
+        overlay.hits.push_back({D2D1::RectF(kMetricsWidth - 50, 8, kMetricsWidth - 12, 42), Action::Metrics});
         out.Line(18, 44, kMetricsWidth - 18, 44, LINE);
         auto row = [&](const wchar_t* label, const std::wstring& value, float y, uint32_t color = WHITE) {
-            out.Text(label, 18, y, 119, 24, 11, MUTED);
-            out.Text(value, 138, y, 154, 24, 12, color, true, DWRITE_TEXT_ALIGNMENT_TRAILING);
+            out.Text(label, 18, y, 166, 24, 11, MUTED);
+            out.Text(value, 184, y, kMetricsWidth - 202, 24, 12, color, true, DWRITE_TEXT_ALIGNMENT_TRAILING);
         };
         wchar_t value[64] {};
         std::swprintf(value, 64, L"%.1f FPS", snapshot.fps); row(L"实际显示帧率", value, 53);
@@ -442,12 +451,15 @@ struct Ui {
         row(L"网络 RTT", value, 105);
         if (snapshot.decodeMs >= 0) std::swprintf(value, 64, L"%.2f ms", snapshot.decodeMs); else std::wcscpy(value, L"\u2014");
         row(L"画面处理", value, 131);
-        row(L"视频解码", snapshot.hardwareDecode ? L"GPU 硬件解码" : L"等待硬件解码", 157, snapshot.hardwareDecode ? ACCENT : MUTED);
-        std::swprintf(value, 64, L"%u \u00d7 %u", snapshot.videoWidth, snapshot.videoHeight); row(L"远端分辨率", value, 183);
-        std::swprintf(value, 64, remote_i18n::Text(L"%u 帧"), snapshot.queuedFrames); row(L"等待处理", value, 209);
-        out.Line(18, 245, kMetricsWidth - 18, 245, LINE);
-        out.Text(preview ? L"合成数据 · 仅用于界面预览" : L"处理时间为 CPU 计时，含解码、转换与提交。", 18, 251, 274, 22, 9, MUTED);
-        out.Text(L"该数值不代表完整交互延迟。", 18, 273, 274, 19, 9, MUTED);
+        const bool reported = snapshot.state == SessionState::Connected && snapshot.macEncoderMode != MacVideoEncoderMode::Unknown;
+        const bool decoding = snapshot.state == SessionState::Connected && snapshot.hardwareDecode;
+        row(L"Mac 视频编码", MacEncoderText(snapshot), 157, reported ? ACCENT : MUTED);
+        row(L"Windows 视频解码", decoding ? L"GPU 硬件解码" : L"等待硬件解码", 183, decoding ? ACCENT : MUTED);
+        std::swprintf(value, 64, L"%u \u00d7 %u", snapshot.videoWidth, snapshot.videoHeight); row(L"远端分辨率", value, 209);
+        std::swprintf(value, 64, remote_i18n::Text(L"%u 帧"), snapshot.queuedFrames); row(L"等待处理", value, 235);
+        out.Line(18, 271, kMetricsWidth - 18, 271, LINE);
+        out.Text(preview ? L"合成数据 · 仅用于界面预览" : L"处理时间为 CPU 计时，含解码、转换与提交。", 18, 277, kMetricsWidth - 36, 22, 9, MUTED);
+        out.Text(L"该数值不代表完整交互延迟。", 18, 299, kMetricsWidth - 36, 19, 9, MUTED);
     }
     void DrawSyntheticDesktop() {
         // Entirely synthetic artwork; no screen capture, host connection or credentials.
@@ -567,7 +579,7 @@ struct Ui {
         toolbar.owner = this; metrics.owner = this; metrics.metrics = true;
         captureNotice.owner = this; captureNotice.captureNotice = true;
         // The first mouse message may precede the popup's first WM_PAINT.
-        metrics.hits.push_back({D2D1::RectF(260, 8, 298, 42), Action::Metrics});
+        metrics.hits.push_back({D2D1::RectF(kMetricsWidth - 50, 8, kMetricsWidth - 12, 42), Action::Metrics});
         for (Overlay* overlay : {&toolbar, &metrics, &captureNotice}) {
             if (!overlay->paint.Init()) return false;
             overlay->window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | (overlay->captureNotice ? WS_EX_LAYERED : 0),
@@ -975,6 +987,7 @@ struct Ui {
         bool changed = connected != nextConnected;
         bool canvasVisibleChanged = (next.hardwareDecode || next.fps > 0) != (snapshot.hardwareDecode || snapshot.fps > 0);
         bool restartChanged = next.restartState != snapshot.restartState || next.restartRequestId != snapshot.restartRequestId;
+        bool codecChanged = next.macEncoderMode != snapshot.macEncoderMode || next.hardwareDecode != snapshot.hardwareDecode;
         bool captureChanged = next.captureState != snapshot.captureState || next.message != snapshot.message || restartChanged;
         snapshot = std::move(next); connected = nextConnected;
         if (restartChanged) restartNoticeUntil = GetTickCount64() + (snapshot.restartState == "authorizing" ? 25000 : 10000);
@@ -1015,7 +1028,7 @@ struct Ui {
         PollOverlays();
         if (!NeedsCaptureNotice() && captureNotice.window && IsWindowVisible(captureNotice.window)) PositionOverlays();
         static uint32_t ticks = 0;
-        if (changed || (++ticks % 15 == 0)) {
+        if (changed || codecChanged || (++ticks % 15 == 0)) {
             InvalidateRect(window, nullptr, FALSE);
             if (metrics.window && IsWindowVisible(metrics.window)) InvalidateRect(metrics.window, nullptr, FALSE);
         remote_ui_watchdog::Beat();
@@ -1260,9 +1273,10 @@ bool RenderUiPreview(const wchar_t* path, UiPreview mode) {
     ui.previewOverlays = mode != UiPreview::ConnectedHidden && mode != UiPreview::FullscreenHidden;
     ui.metricsVisible = ui.previewOverlays; ui.options.address = "192.168.1.100:47990";
     if (ui.fullscreen) { ui.width = 1920; ui.height = 1080; }
-    ui.snapshot.state = SessionState::Connected; ui.snapshot.fps = 59.8;
+    ui.snapshot.state = SessionState::Connected; ui.snapshot.fps = 29.8;
     ui.snapshot.bitrateMbps = 8.62; ui.snapshot.networkMs = 1.24; ui.snapshot.decodeMs = 1.70;
     ui.snapshot.hardwareDecode = true; ui.snapshot.actualFrames = 1234;
+    ui.snapshot.macEncoderMode = MacVideoEncoderMode::AppleSoftware;
     UINT pixelWidth = static_cast<UINT>(ui.width), pixelHeight = static_cast<UINT>(ui.height);
     IWICImagingFactory* wic = nullptr; IWICBitmap* bitmap = nullptr; ID2D1RenderTarget* target = nullptr;
     IWICStream* stream = nullptr; IWICBitmapEncoder* encoder = nullptr; IWICBitmapFrameEncode* frame = nullptr;
@@ -1448,7 +1462,7 @@ bool RunUiSelfTest(HINSTANCE instance, const wchar_t* reportPath) {
         bool bodyNotDraggable = !ui.metrics.dragging;
         SendMessageW(ui.metrics.window, WM_CANCELMODE, 0, 0);
         SendMessageW(ui.metrics.window, WM_LBUTTONDOWN, MK_LBUTTON,
-            MAKELPARAM(static_cast<int>(279 * ui.scale), static_cast<int>(25 * ui.scale)));
+            MAKELPARAM(static_cast<int>((kMetricsWidth - 31) * ui.scale), static_cast<int>(25 * ui.scale)));
         check("metrics_body_and_close_button_do_not_start_drag", bodyNotDraggable && !ui.metrics.dragging && ui.metrics.pressed >= 0);
         SendMessageW(ui.metrics.window, WM_CANCELMODE, 0, 0);
         check("metrics_drag_and_cancel_never_send_remote_input", session.ordinaryInputs == before && session.releaseInputs == releasesBeforeDrag);
