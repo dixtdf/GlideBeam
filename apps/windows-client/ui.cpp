@@ -1472,9 +1472,24 @@ bool RunUiSelfTest(HINSTANCE instance, const wchar_t* reportPath) {
         const uint64_t releasesBeforeDrag = session.releaseInputs;
         const HWND focusBeforeDrag = GetFocus();
         const bool toolsBeforeDrag = ui.toolsVisible;
+        RECT dragClient {}; GetClientRect(window, &dragClient);
+        const RECT metricsBeforeDrag = metricsRect();
+        const int metricsWidth = metricsBeforeDrag.right - metricsBeforeDrag.left;
+        const int metricsHeight = metricsBeforeDrag.bottom - metricsBeforeDrag.top;
+        // The taller diagnostics panel can place (40, 140) beyond the lower
+        // edge of a 700 px test owner at 100% DPI. Expect its legal clamped
+        // position while still verifying movement and every input invariant.
+        const int expectedDragX = std::clamp<int>(40, 0, std::max(0L, dragClient.right - metricsWidth));
+        const int expectedDragY = std::clamp<int>(140, 0, std::max(0L, dragClient.bottom - metricsHeight));
         dragMetricsTo(40, 140);
         RECT dragged = metricsRect(); after = canvasRect();
-        check("metrics_title_drag_moves_without_focus_canvas_or_input_changes", dragged.left == 40 && dragged.top == 140 &&
+        diagnostics += "  \"metrics_drag_state\": {\"scale\": " + std::to_string(ui.scale) +
+            ", \"client_size\": [" + std::to_string(dragClient.right) + "," + std::to_string(dragClient.bottom) +
+            "], \"panel_size\": [" + std::to_string(metricsWidth) + "," + std::to_string(metricsHeight) +
+            "], \"requested\": [40,140], \"expected\": [" + std::to_string(expectedDragX) + "," + std::to_string(expectedDragY) +
+            "], \"actual\": [" + std::to_string(dragged.left) + "," + std::to_string(dragged.top) + "]},\n";
+        check("metrics_title_drag_moves_without_focus_canvas_or_input_changes", dragged.left == expectedDragX && dragged.top == expectedDragY &&
+            !EqualRect(&metricsBeforeDrag, &dragged) && dragged.right - dragged.left == metricsWidth && dragged.bottom - dragged.top == metricsHeight &&
             metricsInside() && GetFocus() == focusBeforeDrag && focusBeforeDrag == ui.canvas && !ui.metrics.dragging &&
             GetCapture() != ui.metrics.window && EqualRect(&initialCanvas, &after) && ui.toolsVisible == toolsBeforeDrag &&
             session.ordinaryInputs == before && session.releaseInputs == releasesBeforeDrag);

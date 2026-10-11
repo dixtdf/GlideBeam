@@ -93,6 +93,7 @@ smoke 新增 `audio_timing` 元数据，与视频阶段一起每 500 ms 采样�
 - 生产捕获恢复 probe 使用自有合成 `CMSampleBuffer` 调用真实生命周期方法，不启动桌面捕获、不读取配对令牌，也不操作系统 UI。修复版 **41 / 41** 通过，0 项跳过。
 - 对照版只移除旧 recovery 清 gate 后的通知，得到 **40 / 41**：唯一失败是 `static_pending_idr_woken_after_stale_recovery`。恢复通知后该项通过，证明测试覆盖了所修复的丢唤醒窗口。
 - Windows worker timer probe 覆盖创建 / 设定 / 等待失败、超时后的回退、停止竞争及 handle 清理，并单独记录真实 timer 采样；不以脆弱的固定耗时阈值替代正确性测试。
+- 统计面板增高后，拖拽回归测试的固定目标坐标在较小窗口里可能越过合法边界。测试改为从实际 client / panel 尺寸独立计算限制后的预期位置，同时保留实际移动、焦点不变、画布不变及不发送远端输入的断言；不能通过删除边界检查来让 CI 通过。
 
 测试源：[encoder-wake-test.cpp](../apps/macos-host/probes/encoder-wake-test.cpp)、[capture-recovery-probe.mm](../apps/macos-host/probes/capture-recovery-probe.mm)、[worker-wait.cpp](../apps/windows-client/probes/worker-wait.cpp)。本机完整 Windows 与 Mac 离线回归、双端构建、双语界面检查及公开源码扫描均通过。实机使用 `0.3.0-dev.latency` 开发构建，未创建发布版本或 tag。
 
