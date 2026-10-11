@@ -78,6 +78,23 @@ void ApplyRestartCapabilities(SessionSnapshot& snapshot,const std::string& messa
         else if(snapshot.restartState!="queued"&&snapshot.restartState!="authorizing"&&snapshot.restartState!="requested")snapshot.restartBusy=false;
     }
 }
+void ApplyEncoderStatus(SessionSnapshot& snapshot,const std::string& message){
+    if(message.size()>16384||JsonString(message,"type")!="host-status")return;
+    // An old host, unknown mode, or unavailable encoder must never inherit a
+    // previous hardware/software claim. Host strings are not shown verbatim.
+    snapshot.macEncoderMode=MacVideoEncoderMode::Unknown;
+    auto value=JsonString(message,"encoder_mode");
+    if(value=="hardware")snapshot.macEncoderMode=MacVideoEncoderMode::Hardware;
+    else if(value=="apple-software")snapshot.macEncoderMode=MacVideoEncoderMode::AppleSoftware;
+    else if(value=="software")snapshot.macEncoderMode=MacVideoEncoderMode::Software;
+}
+const char* VideoPathMessage(MacVideoEncoderMode mode,bool hardwareDecode){
+    if(mode==MacVideoEncoderMode::Hardware)return hardwareDecode?
+        "Mac 硬件 H.264 编码 · Windows GPU 硬解":"Mac 硬件 H.264 编码 · 等待 Windows GPU 硬解";
+    if(mode==MacVideoEncoderMode::AppleSoftware||mode==MacVideoEncoderMode::Software)return hardwareDecode?
+        "Mac 软件 H.264 编码 · Windows GPU 硬解":"Mac 软件 H.264 编码 · 等待 Windows GPU 硬解";
+    return hardwareDecode?"H.264 编码 · Windows GPU 硬解":"H.264 编码 · 等待 Windows GPU 硬解";
+}
 std::string Quote(const std::string& s){std::string r="\"";for(char c:s){if(c=='"'||c=='\\')r+='\\';if((unsigned char)c>=32)r+=c;}return r+'"';}
 std::string Hex(const uint8_t* data,size_t length){static const char* h="0123456789abcdef";std::string r;r.reserve(length*2);for(size_t i=0;i<length;i++){r+=h[data[i]>>4];r+=h[data[i]&15];}return r;}
 bool Unhex(const std::string& s,std::vector<uint8_t>& r){if(s.size()%2||s.size()>65536)return false;r.clear();auto nib=[](char c)->int{if(c>='0'&&c<='9')return c-'0';if(c>='a'&&c<='f')return c-'a'+10;if(c>='A'&&c<='F')return c-'A'+10;return-1;};for(size_t i=0;i<s.size();i+=2){int a=nib(s[i]),b=nib(s[i+1]);if(a<0||b<0)return false;r.push_back((uint8_t)(a*16+b));}return true;}
@@ -151,7 +168,8 @@ class ClientSession final:public IClientSession {
     std::shared_ptr<remote_exchange::Session> exchange_;
     void state(SessionState s,const std::string& message){
         bool changed=false;
-        {std::lock_guard lock(stateMutex_);changed=snapshot_.state!=s;snapshot_.state=s;snapshot_.message=message;}
+        {std::lock_guard lock(stateMutex_);changed=snapshot_.state!=s;snapshot_.state=s;snapshot_.message=message;
+         if(s!=SessionState::Connected){snapshot_.macEncoderMode=MacVideoEncoderMode::Unknown;snapshot_.hardwareDecode=false;}}
         if(changed || s==SessionState::Error)remote_log::Write(s==SessionState::Error?remote_log::Level::Error:remote_log::Level::Info,
             "session","state="+std::to_string(static_cast<int>(s))+" error_class="+remote_log::ErrorClass(s==SessionState::Error?message:std::string_view{}));
     }
@@ -237,6 +255,7 @@ class ClientSession final:public IClientSession {
                             std::string message((char*)packet.data(),count);
                             {
                                 std::lock_guard lock(stateMutex_);
+                                ApplyEncoderStatus(snapshot_,message);
                                 ApplyRestartCapabilities(snapshot_,message);
                                 if(ApplyRestartStatus(snapshot_,message))remote_log::Write(remote_log::Level::Info,"restart-mac","state="+snapshot_.restartState+" request_id="+snapshot_.restartRequestId);
                             }
@@ -252,7 +271,8 @@ class ClientSession final:public IClientSession {
                                     if(captureNotice.empty())captureNotice="等待 Mac 恢复画面采集";
                                 } else if(captureInactive) { awaitIdr=true; requestIdr(api,endpoint); }
                                 captureInactive=inactive;
-                                {std::lock_guard lock(stateMutex_);snapshot_.captureState=captureState;}
+                                {std::lock_guard lock(stateMutex_);snapshot_.captureState=captureState;
+                                 if(inactive){snapshot_.hardwareDecode=false;snapshot_.macEncoderMode=MacVideoEncoderMode::Unknown;}}
                             }
                             if(captureInactive)state(SessionState::Connected,captureNotice);
                             else if(!error.empty())state(SessionState::Connected,error);
@@ -274,14 +294,14 @@ class ClientSession final:public IClientSession {
                             auto before=video->Presented();
                             if(!video->Decode(header,packet.data()+sizeof(header),count-sizeof(header))){state(SessionState::Error,video->Error());stop_=true;break;}
                             awaitIdr=false;bytes+=count;frames+=video->Presented()-before;
-                            {std::lock_guard lock(stateMutex_);snapshot_.actualFrames+=video->Presented()-before;snapshot_.hardwareDecode=video->Hardware();snapshot_.decodeMs=video->LastDecodeMs();snapshot_.message=video->Hardware()?"3060 硬编码 · Windows GPU 硬解":"等待首帧硬解输出";}
+                            {std::lock_guard lock(stateMutex_);snapshot_.actualFrames+=video->Presented()-before;snapshot_.hardwareDecode=video->Hardware();snapshot_.decodeMs=video->LastDecodeMs();snapshot_.message=VideoPathMessage(snapshot_.macEncoderMode,video->Hardware());}
                         }
                     }
                     if(video&&!captureInactive){
                         auto before=video->Presented();
                         if(!video->Tick()){state(SessionState::Error,video->Error());stop_=true;break;}
                         auto displayed=video->Presented()-before;frames+=displayed;
-                        if(displayed){std::lock_guard lock(stateMutex_);snapshot_.actualFrames+=displayed;snapshot_.hardwareDecode=video->Hardware();snapshot_.decodeMs=video->LastDecodeMs();snapshot_.message="3060 硬编码 · Windows GPU 硬解";}
+                        if(displayed){std::lock_guard lock(stateMutex_);snapshot_.actualFrames+=displayed;snapshot_.hardwareDecode=video->Hardware();snapshot_.decodeMs=video->LastDecodeMs();snapshot_.message=VideoPathMessage(snapshot_.macEncoderMode,video->Hardware());}
                     }
                     auto now=std::chrono::steady_clock::now();double elapsed=std::chrono::duration<double>(now-lastStats).count();
                     if(elapsed>=1.0){
@@ -366,6 +386,17 @@ public:
     SessionSnapshot Snapshot()const override{std::lock_guard lock(stateMutex_);return snapshot_;}
     void ResizeViewport(const RECT& rect)override{std::lock_guard lock(stateMutex_);viewport_=rect;}
     bool TakeCursor(std::vector<uint8_t>& packet)override{std::lock_guard lock(stateMutex_);if(cursor_.empty())return false;packet.swap(cursor_);return true;}
+    static bool TestCodecStateReset(){
+        // A failed connection and an explicit disconnect must not retain the
+        // previous Mac encoder or Windows decoder claim on the next attempt.
+        ClientSession client;
+        auto seed=[&]{client.snapshot_.state=SessionState::Connected;
+            client.snapshot_.macEncoderMode=MacVideoEncoderMode::AppleSoftware;client.snapshot_.hardwareDecode=true;};
+        auto cleared=[&]{auto snapshot=client.Snapshot();return snapshot.macEncoderMode==MacVideoEncoderMode::Unknown&&!snapshot.hardwareDecode;};
+        seed();client.state(SessionState::Error,"synthetic connection failure");if(!cleared())return false;
+        seed();client.state(SessionState::Connecting,"synthetic reconnect");if(!cleared())return false;
+        seed();client.Disconnect();return cleared()&&client.Snapshot().state==SessionState::Idle;
+    }
     static bool TestRetainedBulkLifetime(){
         // An Explorer/OLE stream can retain this engine after the owning client
         // is gone. Exercise its sender after destruction without any network.
@@ -426,6 +457,33 @@ bool RunSessionSelfTest(){
     if(TransportErrorText("unexpected socket failure")!="连接已中断，请检查 Mac 端状态后重试")return false;
     if(JsonBool("{\"flag\":\"true\"}","flag")||JsonBool("{\"flag\":truex}","flag")||JsonBool("{\"other\":true}","flag"))return false;
     if(JsonBool("{\"flag\":false}","flag")!=false||JsonBool("{\"flag\": true }","flag")!=true)return false;
+    SessionSnapshot encoder;
+    auto encoderMessage=[&](bool hardwareDecode){return std::string(VideoPathMessage(encoder.macEncoderMode,hardwareDecode));};
+    if(encoderMessage(false)!="H.264 编码 · 等待 Windows GPU 硬解"||
+       encoderMessage(true)!="H.264 编码 · Windows GPU 硬解")return false;
+    ApplyEncoderStatus(encoder,"{\"type\":\"host-status\",\"encoder_mode\":\"hardware\",\"encoder_id\":\"synthetic-hw\",\"fps\":60}");
+    if(encoder.macEncoderMode!=MacVideoEncoderMode::Hardware||encoderMessage(true)!="Mac 硬件 H.264 编码 · Windows GPU 硬解"||
+       encoderMessage(false)!="Mac 硬件 H.264 编码 · 等待 Windows GPU 硬解")return false;
+    ApplyEncoderStatus(encoder,"{\"type\":\"host-command-status\",\"encoder_mode\":\"apple-software\"}");
+    if(encoder.macEncoderMode!=MacVideoEncoderMode::Hardware)return false;
+    ApplyEncoderStatus(encoder,"{\"type\":\"host-status\",\"encoder_mode\":\"apple-software\",\"encoder_id\":\"com.apple.videotoolbox.videoencoder.h264\",\"fps\":30}");
+    if(encoder.macEncoderMode!=MacVideoEncoderMode::AppleSoftware||encoderMessage(true)!="Mac 软件 H.264 编码 · Windows GPU 硬解"||
+       encoderMessage(false)!="Mac 软件 H.264 编码 · 等待 Windows GPU 硬解")return false;
+    ApplyEncoderStatus(encoder,"{\"type\":\"host-status\",\"encoder_mode\":\"hardware\",\"padding\":\""+std::string(16384,'x')+"\"}");
+    if(encoder.macEncoderMode!=MacVideoEncoderMode::AppleSoftware)return false;
+    ApplyEncoderStatus(encoder,"{\"type\":\"host-status\",\"capture_state\":\"running\"}");
+    if(encoder.macEncoderMode!=MacVideoEncoderMode::Unknown||encoderMessage(true)!="H.264 编码 · Windows GPU 硬解")return false;
+    ApplyEncoderStatus(encoder,"{\"type\":\"host-status\",\"encoder_mode\":\"software\"}");
+    if(encoder.macEncoderMode!=MacVideoEncoderMode::Software)return false;
+    ApplyEncoderStatus(encoder,"{\"type\":\"host-status\",\"encoder_mode\":\"unavailable\"}");
+    if(encoder.macEncoderMode!=MacVideoEncoderMode::Unknown)return false;
+    ApplyEncoderStatus(encoder,"{\"type\":\"host-status\",\"encoder_mode\":\"hardware\"}");
+    ApplyEncoderStatus(encoder,"{\"type\":\"host-status\",\"encoder_mode\":\"future-codec /private/path token=synthetic\"}");
+    if(encoder.macEncoderMode!=MacVideoEncoderMode::Unknown||encoderMessage(true).find("synthetic")!=std::string::npos)return false;
+    ApplyEncoderStatus(encoder,"{\"type\":\"host-status\",\"encoder_mode\":\"hardware\"}");
+    ApplyEncoderStatus(encoder,"{\"type\":\"host-status\",\"encoder_mode\":true}");
+    if(encoder.macEncoderMode!=MacVideoEncoderMode::Unknown)return false;
+    if(!ClientSession::TestCodecStateReset())return false;
     SessionSnapshot restart;
     ApplyRestartCapabilities(restart,"{\"type\":\"host-status\",\"restart_supported\":true,\"restart_requires_local_authorization\":true,\"restart_busy\":false}");
     if(!restart.restartSupported||!restart.restartRequiresLocalAuthorization||restart.restartBusy)return false;

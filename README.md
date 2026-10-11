@@ -6,12 +6,12 @@
 
 [简体中文](README.zh-CN.md) · [Downloads](https://github.com/dixtdf/GlideBeam/releases) · [Build instructions](docs/building.md) · [Compatibility](docs/compatibility.md)
 
-GlideBeam combines a local Windows cursor, independent input transport, Mac H.264 hardware encoding, and Windows GPU decoding. Its native, flat interface supports **English, Simplified Chinese, and Follow system**, with a saved language preference on each computer.
+GlideBeam combines a local Windows cursor, independent input transport, Mac H.264 encoding, and Windows GPU decoding. The Mac prefers hardware encoding and falls back to Apple's software encoder when unavailable. Its native, flat interface supports **English, Simplified Chinese, and Follow system**, with a saved language preference on each computer.
 
 ## Features
 
 - Native Windows 11 client and macOS host; a full-screen desktop with an automatically hidden top toolbar and movable, window-bounded diagnostics overlay.
-- ScreenCaptureKit capture and VideoToolbox H.264 hardware encoding on Mac; Media Foundation/D3D11 hardware decoding and GPU presentation on Windows.
+- ScreenCaptureKit capture and VideoToolbox H.264 encoding on Mac, with hardware preference and a software fallback capped at 30 FPS; Media Foundation/D3D11 hardware decoding and GPU presentation on Windows.
 - Pair using an address and one customizable, persistent token. Ten consecutive invalid token proofs block the source IP; the Mac UI can unblock it.
 - Two-way Unicode text and image clipboard sharing; files and folders through copy/paste, drag/drop, or the transfer panel. Progress, pause/resume, cancellation, and SHA-256 verification.
 - Rotating logs on both computers, Mac start at login, and an authenticated Mac restart command with native administrator authorization.

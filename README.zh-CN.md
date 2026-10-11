@@ -6,12 +6,12 @@
 
 [English](README.md) · [下载](https://github.com/dixtdf/GlideBeam/releases) · [构建说明](docs/building.md) · [兼容性](docs/compatibility.md)
 
-光梭采用 Windows 本地光标、独立键鼠通道、Mac H.264 硬件编码与 Windows GPU 解码。双端原生扁平界面提供 **简体中文、English、跟随系统**，分别保存语言偏好。
+光梭采用 Windows 本地光标、独立键鼠通道、Mac H.264 编码与 Windows GPU 解码。Mac 优先硬件编码，不可用时回退到 Apple 软件编码器。双端原生扁平界面提供 **简体中文、English、跟随系统**，分别保存语言偏好。
 
 ## 已有功能
 
 - Windows 11 原生客户端和 macOS 主机端；真正全屏、顶部自动隐藏工具栏、可拖动且限制在窗口内的状态浮窗。
-- Mac 使用 ScreenCaptureKit 采集、VideoToolbox H.264 硬件编码；Windows 使用 Media Foundation / D3D11 硬件解码和 GPU 呈现。
+- Mac 使用 ScreenCaptureKit 采集、VideoToolbox H.264 编码；优先硬件，不可用时软件回退并限制到 30 FPS。Windows 使用 Media Foundation / D3D11 硬件解码和 GPU 呈现。
 - 地址加一个可自定义、持久保存的配对令牌。同一 IP 连续 10 次完整错误令牌验证后封禁，Mac 界面可解除封禁。
 - 双向 Unicode 文本和图片剪贴板；复制粘贴、拖拽和文件面板传输文件及文件夹。支持进度、暂停、继续、取消与 SHA-256 校验。
 - 双端轮转日志、Mac 登录后自启，以及经过配对鉴权和系统管理员授权的 Mac 重启功能。

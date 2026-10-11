@@ -20,6 +20,9 @@ struct ConnectionOptions {
     bool persistSettings = true;
 };
 enum class SessionState { Idle, Connecting, Connected, Error };
+// Reported by the Mac host. The screen stream encodes on Mac and decodes on
+// Windows; an older host may not report its encoder mode.
+enum class MacVideoEncoderMode { Unknown, Hardware, AppleSoftware, Software };
 struct SessionSnapshot {
     SessionState state = SessionState::Idle;
     std::string message;
@@ -30,6 +33,7 @@ struct SessionSnapshot {
     double fps = 0, bitrateMbps = 0, networkMs = -1, decodeMs = -1;
     uint32_t queuedFrames = 0;
     uint64_t actualFrames = 0;
+    MacVideoEncoderMode macEncoderMode = MacVideoEncoderMode::Unknown;
     bool hardwareDecode = false;
     bool restartSupported = false;
     bool restartRequiresLocalAuthorization = true;
