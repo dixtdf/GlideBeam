@@ -2,7 +2,7 @@
 
 Build from the repository root. `VERSION` controls release names and UI version metadata. Rust 1.99.0 is pinned in `rust-toolchain.toml`; use `--locked` to preserve `Cargo.lock`. First-party native code requires C++20.
 
-Audio is currently a development-branch feature; released `v0.2.1` binaries do not contain it. The paired audio tests used `0.3.0-dev.audio`: pass `-Version 0.3.0-dev.audio` to the Windows build and use `0.3.0-dev.audio` as the third argument of `build-macos.sh` for matching test metadata. Build both endpoints from the same branch. These overrides do not create a release or change `VERSION`.
+System audio is included from 0.3.0 onward; released `v0.2.1` binaries do not contain it. Build both endpoints from the same revision. Version overrides are useful for development metadata; they do not create a release or change `VERSION`.
 
 ## Windows x64
 
@@ -33,6 +33,21 @@ python scripts/package-ci.py --platform Windows --architecture arm64 --runtime d
 ```
 
 ARM64 binaries are verified for architecture, manifest, and imports. They are not executed on an x64 runner, and physical Windows ARM64 operation remains unvalidated. Their runtime includes the applicable ARM64 `libunwind.dll` alongside the transport DLL.
+
+## Windows Setup installers
+
+Build the portable ZIP first using the matching architecture commands above. The installer builder validates and stages that ZIP's public allowlist, rather than packaging the working directory. Inno Setup 6.7.3 and its matching Simplified Chinese translation are pinned by SHA-256 in the setup helper.
+
+```powershell
+./scripts/setup-inno.ps1 -Destination ./tools/inno-6.7.3
+./scripts/build-windows-installer.ps1 -PackagePath ./artifacts/GlideBeam-1.0.0-Windows-x64.zip -Architecture x64 -OutputDirectory ./artifacts -ISCCPath ./tools/inno-6.7.3/compiler/ISCC.exe
+```
+
+Replace `1.0.0` with `VERSION`, and use `arm64` in the filename and architecture argument for ARM64. If direct downloads fail, the setup helper accepts `-Proxy http://127.0.0.1:10808` for an available local proxy. The helper installs a private portable compiler beneath its destination without adding file associations or Start menu entries.
+
+Each build produces `GlideBeam-<version>-Windows-<architecture>-Setup.exe` and `.exe.sha256`. The application payload is the same as the corresponding portable ZIP. Setup installs per user, offers English/Simplified Chinese and shortcuts, and does not require administrator privileges. Upgrade and uninstall retain `%LOCALAPPDATA%\RemoteNative` settings. The compiler's launcher architecture does not describe the bundled application's architecture; ARM64 payload validation remains separate.
+
+The Windows x64 CI job checks a silent install, same-version repair and uninstall in an isolated directory, including installed file hashes, shortcuts, uninstall registration and configuration retention. It does not launch a real remote session. An ARM64 package is compiled and checked on x64 without executing its application; physical ARM64 installation and use remain unvalidated.
 
 ## macOS Intel or Apple Silicon
 

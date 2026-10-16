@@ -19,16 +19,18 @@
 
 当前覆盖已登录的单屏 Mac 桌面与局域网。尚未实现麦克风转发、富文本、目录镜像、登录前控制或公网中继。视频使用 H.264，不承诺 HEVC 支持。
 
-音频已包含在 [v0.3.0](https://github.com/dixtdf/GlideBeam/releases/tag/v0.3.0)，需要更新双端；旧版 `v0.2.1` 不含音频。变更与验证范围见 [0.3.0 发布说明](docs/releases/0.3.0.md)。
+[v1.0.0](https://github.com/dixtdf/GlideBeam/releases/tag/v1.0.0) 新增 Windows Setup 安装程序，继续提供便携 ZIP，保留 0.3.0 的系统音频和诊断功能；从 0.2.1 更新时请同时更新双端。安装方式与验证范围见 [1.0.0 发布说明](https://github.com/dixtdf/GlideBeam/blob/v1.0.0/docs/releases/1.0.0.md)。
 
 ## 开始使用
 
-1. 按两台电脑的架构下载发行包。Windows 包含 `GlideBeam.exe`、`Start-GlideBeam.cmd`；Mac 包含 `GlideBeam Host.app`。
+1. 按两台电脑的架构下载发行包。Windows 的 Intel/AMD 电脑运行 `GlideBeam-1.0.0-Windows-x64-Setup.exe`，ARM 电脑选择 ARM64 Setup，也可继续使用便携 ZIP；Mac ZIP 包含 `GlideBeam Host.app`。
 2. 打开 Mac 端，在系统设置允许「屏幕录制」和「辅助功能」。必要时使用「设置屏幕与输入权限」「重试画面采集」。需要可用的 Mac 桌面和显示器采集源。
 3. 复制 Mac 窗口显示的地址与完整配对令牌，在 Windows 客户端填写并连接。默认端口为 **UDP 47990**，需要局域网放行。VNC 密码不能代替光梭的配对令牌。
 4. 将鼠标移到远控窗口顶部中央即可显示工具栏，打开文件传输、统计、日志或重启控制。关闭 Mac 连接窗口后，主机端仍在菜单栏运行。
 
 两端可分别选择「跟随系统」「English」「简体中文」。Windows 入口为「偏好设置 → 界面语言」，连接后也可在「更多 → 语言」切换；Mac 窗口顶部和菜单均提供入口。「登录后自动启动」在该用户进入 macOS 桌面后运行，不提供登录前控制。
+
+Windows Setup 支持简体中文和 English，仅为当前用户安装到 `%LOCALAPPDATA%\Programs\GlideBeam`，无需管理员权限。安装时创建开始菜单快捷方式，桌面快捷方式可选。运行新版 Setup 即可升级，在 Windows「已安装的应用」中卸载；升级和卸载均保留 `%LOCALAPPDATA%\RemoteNative` 中的设置及配对资料。Windows 程序和安装包尚未签名。便携版请完整解压到同一目录，运行 `GlideBeam.exe` 或 `Start-GlideBeam.cmd`。
 
 断开连接只释放远端键鼠状态，**不会主动锁定 Mac**。macOS 自身的屏保、睡眠和密码设置仍然生效。
 
@@ -57,7 +59,7 @@ Windows x64 与 Intel Mac 已在上述环境进行实际会话验证。**Windows
 
 [构建说明](docs/building.md)覆盖 Windows x64 / ARM64 与 Mac Intel / Apple Silicon。项目使用 C++20、Objective-C++ 和 Rust QUIC 传输；版本取自 `VERSION`，依赖由 `Cargo.lock` 锁定，Rust 编译器由 `rust-toolchain.toml` 锁定。
 
-[GitHub Actions](.github/workflows/build.yml)已配置 push、PR 和手动运行的四架构构建。推送与 `VERSION` 匹配的 `v<VERSION>` 标签后，所有构建通过才准备 **Draft Release**，包含四个 ZIP 和 `SHA256SUMS.txt`。CI 覆盖离线测试及架构校验，不会执行真实桌面会话或实体 ARM64 验收。触发方式和发布行为见[发布说明](docs/release.md)。
+[GitHub Actions](.github/workflows/build.yml)在 push、PR 和手动运行时构建四架构 ZIP 与两个 Windows Setup。推送与 `VERSION` 匹配的 `v<VERSION>` 标签后，所有构建通过才准备 **Draft Release**，包含四个 ZIP、两个 Setup EXE 和 `SHA256SUMS.txt`。CI 检查 x64 安装、同版本修复、卸载及离线测试和架构，不会执行真实桌面会话或实体 ARM64 验收。触发方式和发布行为见[发布说明](docs/release.md)。
 
 ## 文档
 

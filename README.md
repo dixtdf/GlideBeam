@@ -19,16 +19,18 @@ GlideBeam combines a local Windows cursor, independent input transport, Mac H.26
 
 The initial scope is an already logged-in, single-display Mac desktop on a LAN. Microphone forwarding, rich text, directory mirroring, unattended login-screen control, and an Internet relay are not implemented. H.264 is the current video codec; HEVC is not promised.
 
-Audio is included in [v0.3.0](https://github.com/dixtdf/GlideBeam/releases/tag/v0.3.0). Update both endpoints to use it; older `v0.2.1` packages do not include audio. See the [0.3.0 release notes](docs/releases/0.3.0.md) for changes and validation scope.
+[v1.0.0](https://github.com/dixtdf/GlideBeam/releases/tag/v1.0.0) adds Windows Setup installers alongside the portable ZIPs. It retains the system audio and diagnostics introduced in 0.3.0; update both endpoints if coming from 0.2.1. See the [1.0.0 release notes](https://github.com/dixtdf/GlideBeam/blob/v1.0.0/docs/releases/1.0.0.md) for installation details and validation scope.
 
 ## Get started
 
-1. Download the package for each computer's architecture. Windows packages contain `GlideBeam.exe` and `Start-GlideBeam.cmd`; Mac packages contain `GlideBeam Host.app`.
+1. Download the package for each computer's architecture. On Windows, run `GlideBeam-1.0.0-Windows-x64-Setup.exe` (Intel/AMD) or the ARM64 Setup on an ARM PC; a portable ZIP is also available. Mac ZIPs contain `GlideBeam Host.app`.
 2. Open the Mac host. Grant **Screen Recording** and **Accessibility** in System Settings, and use **Screen and input permissions** / **Retry capture** if needed. A working Mac desktop and display source are required.
 3. Copy the address and full pairing token shown by the Mac host. Enter both in the Windows client and connect. The default port is **UDP 47990**; allow it on your LAN. An existing VNC password is unrelated to GlideBeam pairing.
 4. Move the pointer to the top center of the remote window to reveal the toolbar. File transfer, statistics, logs, and restart controls are available there. The Mac host can continue in the menu bar when its window closes.
 
 Choose **Follow system**, **English**, or **简体中文** separately on each computer. Windows provides **Preferences → Interface language**, plus **More → Language** while connected. Mac provides a language selector at the top of the host window and in its menu. Enable **Start at login** on Mac to run after that user logs in; it does not provide control before login.
+
+Windows Setup installs for the current user into `%LOCALAPPDATA%\Programs\GlideBeam`, without administrator privileges. It offers English/Simplified Chinese, a Start menu shortcut and an optional desktop shortcut. Run a newer Setup to upgrade, or use Windows **Installed apps** to uninstall. Both retain settings and pairing data in `%LOCALAPPDATA%\RemoteNative`. The Windows app and installer are unsigned. Portable ZIP users should extract the whole package into one folder and run `GlideBeam.exe` or `Start-GlideBeam.cmd`.
 
 Disconnecting GlideBeam releases remote keyboard/mouse state and does **not** actively lock the Mac. macOS screen saver, sleep, and password settings remain in effect.
 
@@ -57,7 +59,7 @@ A target of 60 FPS is a pacing goal, not a guarantee of delivered frame rate or 
 
 The [build guide](docs/building.md) covers Windows x64 / ARM64 and Mac Intel / Apple Silicon. Core code is C++20 / Objective-C++ with a Rust QUIC transport. Versions come from `VERSION`; Rust dependencies are locked by `Cargo.lock` and the compiler by `rust-toolchain.toml`.
 
-[GitHub Actions](.github/workflows/build.yml) is configured to build four architecture packages on pushes, pull requests, and manual runs. A matching `v<VERSION>` tag prepares a **draft** release containing four ZIPs and `SHA256SUMS.txt` after all builds pass. Hosted CI uses offline/native API tests and architecture checks; it does not perform a real desktop or physical ARM64 session. See the [release guide](docs/release.md) for exact behavior.
+[GitHub Actions](.github/workflows/build.yml) builds four architecture packages and two Windows Setup installers on pushes, pull requests, and manual runs. A matching `v<VERSION>` tag prepares a **draft** release containing four ZIPs, two Setup EXEs and `SHA256SUMS.txt` after all builds pass. Hosted CI checks the x64 installer lifecycle, offline/native APIs and architecture; it does not perform a real desktop or physical ARM64 session. See the [release guide](docs/release.md) for exact behavior.
 
 ## Documentation
 

@@ -17,7 +17,7 @@ A usable Mac display source, Screen Recording permission, and Accessibility perm
 
 Software encoding uses CPU resources and is capped at 1080p / 30 FPS, with an 8 Mbps target. These are configuration limits, not a guarantee of delivered frame rate or latency. It uses the original NV12 surface and never applies the NVIDIA-specific layout workaround. Retry capture attempts hardware again.
 
-The tested RTX 3060 environment uses the experimental [nullmoth/nvidia-macos-driver](https://github.com/nullmoth/nvidia-macos-driver). GlideBeam does not include or install that driver and does not require it as a general macOS dependency. The v0.3.0 release makes no driver changes; the reference VM retains driver 1.9.0. The reference VM results do not establish support for other NVIDIA cards, macOS releases, or driver revisions.
+The tested RTX 3060 environment uses the experimental [nullmoth/nvidia-macos-driver](https://github.com/nullmoth/nvidia-macos-driver). GlideBeam does not include or install that driver and does not require it as a general macOS dependency. The v1.0.0 release makes no driver changes; the reference VM retains driver 1.9.0. The reference VM results do not establish support for other NVIDIA cards, macOS releases, or driver revisions.
 
 A narrow NV12 layout workaround is gated by the SHA-256 of a recognized loaded NVENC module. It compensates for that module's particular buffer layout and a padded 1088-line encoding surface, while presenting the intended 1080-line desktop. It does not modify a driver. An unknown module revision is not automatically treated as equivalent and needs separate validation. See the implementation in `apps/macos-host/nv12-layout.hpp`.
 
@@ -32,3 +32,9 @@ Single display, an already logged-in user desktop, LAN access, text/PNG clipboar
 Disconnecting does not actively lock the Mac. Screen saver, power, and password policies are controlled by macOS. A target frame rate of 60 FPS does not guarantee delivered FPS or total input-to-display latency. Static screens can produce very few new capture frames without indicating a transport fault.
 
 Hosted CI checks builds, offline tests, architecture, imports, signatures, and packaging. It cannot establish capture permission, hardware codec behavior, Finder/Explorer drag-and-drop behavior, or remote pointer feel for a particular physical machine. Physical Windows ARM64 and Apple Silicon sessions remain unvalidated.
+
+## Installation
+
+Version 1.0.0 adds Windows x64 and ARM64 Setup installers alongside the portable ZIPs. Setup is per user, defaults to `%LOCALAPPDATA%\Programs\GlideBeam`, and requires no administrator privileges. It creates an uninstall entry and Start menu shortcut, with an optional desktop shortcut. Existing `%LOCALAPPDATA%\RemoteNative` settings and pairing data survive upgrade and uninstall. Portable builds continue to work without installation; Mac delivery remains an architecture-specific ZIP.
+
+The Windows x64 installer lifecycle is checked in an isolated directory in CI. ARM64 packaging checks do not establish a physical ARM64 install or session. Windows apps and installers remain unsigned; Mac apps remain ad-hoc-signed without notarization. The 1.0.0 version marks the installer release, not a new sustained-FPS or audio-quality qualification.

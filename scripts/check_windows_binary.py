@@ -15,7 +15,7 @@ SYSTEM_DLLS = {
 
 
 class PE:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, allow_pe32: bool = False):
         self.data = path.read_bytes()
         if self.data[:2] != b"MZ":
             raise ValueError("Not a PE file: " + path.name)
@@ -24,9 +24,10 @@ class PE:
             raise ValueError("Invalid PE header: " + path.name)
         self.machine, section_count = struct.unpack_from("<HH", self.data, offset + 4)
         optional = offset + 24
-        if self.u16(optional) != 0x20B:
+        magic = self.u16(optional)
+        if magic != 0x20B and not (allow_pe32 and magic == 0x10B):
             raise ValueError("Expected a 64 bit PE file")
-        self.directories = optional + 112
+        self.directories = optional + (96 if magic == 0x10B else 112)
         section_offset = optional + self.u16(offset + 20)
         self.sections = []
         for index in range(section_count):
