@@ -117,6 +117,19 @@ jobs:
           python scripts/third-party-notices.py --output build/third-party/THIRD-PARTY-LICENSES.txt --toolchain-root (Split-Path -Parent $env:GLIDEBEAM_TOOLCHAIN_BIN)
           if ($LASTEXITCODE -ne 0) { throw 'Third party license collection failed' }
           python scripts/package-ci.py --platform Windows --architecture $env:BUILD_ARCHITECTURE --runtime "dist/windows-$env:BUILD_ARCHITECTURE" --output artifacts
+          if ($LASTEXITCODE -ne 0) { throw 'Portable packaging failed' }
+      - name: Set up pinned Inno Setup compiler
+        run: ./scripts/setup-inno.ps1 -Destination (Join-Path $env:RUNNER_TEMP 'inno-6.7.3')
+      - name: Build Windows Setup
+        env:
+          BUILD_ARCHITECTURE: ${{ matrix.architecture }}
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: ./scripts/build-windows-installer.ps1 -PackagePath "artifacts/GlideBeam-$env:RELEASE_VERSION-Windows-$env:BUILD_ARCHITECTURE.zip" -Architecture $env:BUILD_ARCHITECTURE -OutputDirectory artifacts -ISCCPath $env:GLIDEBEAM_ISCC
+      - name: Verify Setup metadata and x64 install, repair and uninstall
+        env:
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+          BUILD_ARCHITECTURE: ${{ matrix.architecture }}
+        run: ./scripts/test-windows-installer.ps1 -InstallerPath "artifacts/GlideBeam-$env:RELEASE_VERSION-Windows-$env:BUILD_ARCHITECTURE-Setup.exe" -PackagePath "artifacts/GlideBeam-$env:RELEASE_VERSION-Windows-$env:BUILD_ARCHITECTURE.zip" -Architecture $env:BUILD_ARCHITECTURE -OutputDirectory (Join-Path $env:RUNNER_TEMP 'glidebeam-installer-test')
       - name: Upload package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -212,17 +225,19 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: GlideBeam-*
           merge-multiple: true
           path: artifacts
       - name: Verify and combine checksums
-        run: |
-          cd artifacts
-          sha256sum --check --strict *.zip.sha256
-          cat *.zip.sha256 | LC_ALL=C sort > SHA256SUMS.txt
-          test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 4
+        run: python scripts/verify-release-assets.py --directory artifacts --write-manifest
       - name: Prepare draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -238,7 +253,7 @@ jobs:
               echo 'Refusing to overwrite an already published release.' >&2
               exit 1
             fi
-            gh release upload "$RELEASE_TAG" artifacts/*.zip artifacts/SHA256SUMS.txt --clobber
+            gh release upload "$RELEASE_TAG" artifacts/*.zip artifacts/*-Setup.exe artifacts/SHA256SUMS.txt --clobber
           else
-            gh release create "$RELEASE_TAG" artifacts/*.zip artifacts/SHA256SUMS.txt "${args[@]}"
+            gh release create "$RELEASE_TAG" artifacts/*.zip artifacts/*-Setup.exe artifacts/SHA256SUMS.txt "${args[@]}"
           fi
