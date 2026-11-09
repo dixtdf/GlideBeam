@@ -553,7 +553,7 @@ public:
 }
 std::unique_ptr<IClientSession> CreateClientSession(){return std::make_unique<ClientSession>();}
 ConnectionOptions LoadConnectionOptions(){
-    ConnectionOptions options;options.address="192.168.1.100:47990";
+    ConnectionOptions options;options.address="127.0.0.1:47990";
     auto text=ReadFile(SettingsPath());if(text.empty())return options;
     auto address=JsonString(text,"address");if(!address.empty())options.address=address;
     options.fingerprint=JsonString(text,"fingerprint");std::vector<uint8_t> encrypted;

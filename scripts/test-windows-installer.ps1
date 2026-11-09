@@ -173,12 +173,19 @@ function Assert-Registration {
     if ($null -ne (Get-InstallRegistration ([Microsoft.Win32.RegistryHive]::LocalMachine) ([Microsoft.Win32.RegistryView]::Registry64))) { throw 'Per-user installer unexpectedly registered a machine-wide application.' }
 }
 $taskShell = New-Object -ComObject WScript.Shell
-function Assert-Shortcut([string]$Path, [string]$Target) {
+$taskShellApp = New-Object -ComObject Shell.Application
+function Assert-Shortcut([string]$Path, [string]$Target, [string]$AppUserModelId = '') {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw 'Installer shortcut is missing.' }
     $shortcut = $taskShell.CreateShortcut($Path)
     try {
         if ([IO.Path]::GetFullPath($shortcut.TargetPath) -ine $Target) { throw 'Installer shortcut points to an unexpected target.' }
     } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) }
+    if ($AppUserModelId) {
+        $item = $taskShellApp.Namespace((Split-Path -Parent $Path)).ParseName((Split-Path -Leaf $Path))
+        try {
+            if ($item.ExtendedProperty('System.AppUserModel.ID') -cne $AppUserModelId) { throw 'Installer shortcut AppUserModelID mismatch.' }
+        } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($item) }
+    }
 }
 function Invoke-TestInstall([string]$LogName) {
     Invoke-InstallerProcess $taskInstaller @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/NOCLOSEAPPLICATIONS', '/NORESTARTAPPLICATIONS', '/TASKS=desktopicon', ('/DIR="' + $taskInstallDirectory + '"'), ('/LOG="' + (Join-Path $taskTestRoot $LogName) + '"'))
@@ -197,9 +204,9 @@ try {
     Invoke-TestInstall 'install.log'
     Assert-InstalledPayload
     Assert-Registration
-    Assert-Shortcut $taskAppShortcut (Join-Path $taskInstallDirectory 'GlideBeam.exe')
+    Assert-Shortcut $taskAppShortcut (Join-Path $taskInstallDirectory 'GlideBeam.exe') 'dixtdf.GlideBeam'
     Assert-Shortcut $taskUninstallShortcut $taskUninstaller
-    Assert-Shortcut $taskDesktopShortcut (Join-Path $taskInstallDirectory 'GlideBeam.exe')
+    Assert-Shortcut $taskDesktopShortcut (Join-Path $taskInstallDirectory 'GlideBeam.exe') 'dixtdf.GlideBeam'
     Assert-ConfigurationPreserved
     Assert-NoApplicationLaunch
     Write-Output 'PASS silent per-user install, payload hashes, Installed Apps registration and shortcuts'
@@ -209,11 +216,30 @@ try {
     Invoke-TestInstall 'repair.log'
     Assert-InstalledPayload
     Assert-Registration
-    Assert-Shortcut $taskAppShortcut (Join-Path $taskInstallDirectory 'GlideBeam.exe')
+    Assert-Shortcut $taskAppShortcut (Join-Path $taskInstallDirectory 'GlideBeam.exe') 'dixtdf.GlideBeam'
     if ([IO.File]::ReadAllText($taskSentinel) -cne $taskSentinelContents) { throw 'Reinstall modified an unknown user file.' }
     Assert-ConfigurationPreserved
     Assert-NoApplicationLaunch
     Write-Output 'PASS same-version upgrade/repair restores owned files and preserves unknown files and configuration'
+
+    if ($taskExistingProcesses.Count -eq 0) {
+        $taskRunning = $null
+        try {
+            $taskRunning = Start-Process -FilePath (Join-Path $taskInstallDirectory 'GlideBeam.exe') -WorkingDirectory $taskInstallDirectory -PassThru
+            Start-Sleep -Seconds 3
+            if ($taskRunning.HasExited) { throw 'The isolated application exited before the running-client Setup test.' }
+            Invoke-InstallerProcess $taskInstaller @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/CLOSEAPPLICATIONS', '/NORESTARTAPPLICATIONS', ('/DIR="' + $taskInstallDirectory + '"'), ('/LOG="' + (Join-Path $taskTestRoot 'running-client-update.log') + '"'))
+            if (-not $taskRunning.WaitForExit(30000)) { throw 'Setup did not close the running application within 30 seconds.' }
+            Assert-InstalledPayload
+            Assert-ConfigurationPreserved
+            Assert-NoApplicationLaunch
+            Write-Output 'PASS Setup automatically closes the running application before replacing its payload'
+        } finally {
+            if ($null -ne $taskRunning -and -not $taskRunning.HasExited) { $taskRunning.Kill() }
+        }
+    } else {
+        Write-Warning 'Skipped the running-client Setup test because another GlideBeam/RemoteNative process is active.'
+    }
 
     Invoke-InstallerProcess $taskUninstaller @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/LOG="' + (Join-Path $taskTestRoot 'uninstall.log') + '"'))
     $taskCleanupNeeded = $false
@@ -250,5 +276,6 @@ try {
             [IO.Directory]::Delete($taskConfigurationDirectory, $false)
         }
         [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($taskShell)
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($taskShellApp)
     }
 }

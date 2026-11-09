@@ -30,6 +30,7 @@ try {
  Invoke-ClientTest '--selftest-exchange' 'native-clipboard.json'
  Invoke-ClientTest '--selftest-exchange-hang' 'file-panel-hang.json'
  Invoke-ClientTest '--selftest-ui' 'ui.json'
+ Invoke-ClientTest '--selftest-updater' 'updater.json'
  $taskCommon = @('-std=c++20', '-O2', '-Wall', '-Wextra', '-Werror', '-static-libgcc', '-static-libstdc++')
  $taskLatency = Join-Path $taskOutput 'latency-stats.exe'
  Invoke-Checked $taskCompiler ($taskCommon + @('shared/probes/latency-stats-test.cpp', '-o', $taskLatency))

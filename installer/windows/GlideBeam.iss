@@ -80,9 +80,9 @@ Type: files; Name: "{app}\libwinpthread-1.dll"
 #endif
 
 [Icons]
-Name: "{group}\GlideBeam"; Filename: "{app}\GlideBeam.exe"; Parameters: "--connect"; WorkingDir: "{app}"
+Name: "{group}\GlideBeam"; Filename: "{app}\GlideBeam.exe"; Parameters: "--connect"; WorkingDir: "{app}"; AppUserModelID: "dixtdf.GlideBeam"
 Name: "{group}\Uninstall GlideBeam"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\GlideBeam"; Filename: "{app}\GlideBeam.exe"; Parameters: "--connect"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autodesktop}\GlideBeam"; Filename: "{app}\GlideBeam.exe"; Parameters: "--connect"; WorkingDir: "{app}"; Tasks: desktopicon; AppUserModelID: "dixtdf.GlideBeam"
 
 [Run]
 Filename: "{app}\GlideBeam.exe"; Parameters: "--connect"; WorkingDir: "{app}"; Description: "{cm:LaunchGlideBeam}"; Flags: nowait postinstall skipifsilent unchecked

@@ -80,6 +80,10 @@ public:
 };
 int CreateUi(HINSTANCE instance, int showCommand, IClientSession& session,
              const ConnectionOptions& initialOptions = {}, bool autoConnect = false);
+// Stable taskbar/pin identity and cross-process activation for the single UI window.
+inline constexpr wchar_t kGlideBeamAppUserModelId[] = L"dixtdf.GlideBeam";
+inline constexpr wchar_t kGlideBeamWindowClass[] = L"RemoteNativeWindow";
+inline constexpr UINT kGlideBeamShowMessage = WM_APP + 42;
 // Renders the same native Direct2D interface to a PNG for visual verification.
 enum class UiPreview { Landing, Connected, Fullscreen, ConnectedHidden, FullscreenHidden, Preferences };
 bool RenderUiPreview(const wchar_t* path, UiPreview mode = UiPreview::Landing);

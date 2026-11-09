@@ -9,6 +9,7 @@
 #include "exchange-windows.h"
 #include "resources.h"
 #include "ui-watchdog.h"
+#include "updater.h"
 #include "../../shared/diagnostic-log.h"
 #include "../../shared/protocol.h"
 #include "cursor-native.h"
@@ -53,13 +54,15 @@ std::wstring EditText(HWND edit) {
     value.resize(size);
     return value;
 }
-enum class Action { Connect, KeyboardMode, Fullscreen, Disconnect, Sessions, Settings, Metrics, Clipboard, Files, More, LanguageSystem, LanguageEnglish, LanguageChinese };
+enum class Action { Connect, KeyboardMode, Fullscreen, Disconnect, Sessions, Settings, Metrics, Clipboard, Files, More, LanguageSystem, LanguageEnglish, LanguageChinese, CheckUpdate, DownloadUpdate, InstallUpdate };
 struct Hit { D2D1_RECT_F rect; Action action; };
 constexpr uint32_t BG = 0x0b1118, NAV = 0x101720, PANEL = 0x121c27;
 constexpr uint32_t LINE = 0x24313f, WHITE = 0xebf2fa, MUTED = 0x8b9aad;
 constexpr uint32_t ACCENT = 0x68e7c1, SOFT = 0x173d38;
 constexpr UINT kPollTimer = 1;
 constexpr UINT kConnectMessage = WM_APP + 1;
+constexpr UINT kTrayMessage = WM_APP + 43;
+constexpr UINT kTrayId = 1;
 constexpr wchar_t kWindowClass[] = L"RemoteNativeWindow";
 constexpr wchar_t kCanvasClass[] = L"RemoteNativeCanvas";
 constexpr wchar_t kOverlayClass[] = L"RemoteNativeSessionOverlay";
@@ -234,19 +237,24 @@ struct Ui {
     bool hiddenCursor = false;
     std::unordered_map<uint64_t, HCURSOR> cursorCache;
     WNDPROC editProc = nullptr;
+    remote_update::Updater updater;
+    remote_update::Snapshot update = updater.GetSnapshot();
+    NOTIFYICONDATAW tray {};
+    bool trayInstalled = false;
+    UINT taskbarCreatedMessage = 0;
     ~Ui() {
         for (const auto& item : cursorCache) DestroyCursor(item.second);
         if (editFont) DeleteObject(editFont);
         if (editBrush) DeleteObject(editBrush);
     }
     void HitButton(Action action, float x, float y, float w, float h, const std::wstring& label,
-                   bool primary = false, bool compact = false) {
-        bool hover = hoverAction == static_cast<int>(action);
-        uint32_t fill = primary ? (hover ? 0x8df1d3 : ACCENT) : (hover ? 0x263440 : 0x192633);
-        paint.Round(x, y, w, h, compact ? 7.f : 9.f, fill, primary ? 0 : LINE);
+                   bool primary = false, bool compact = false, bool enabled = true) {
+        bool hover = enabled && hoverAction == static_cast<int>(action);
+        uint32_t fill = !enabled ? 0x141e28 : primary ? (hover ? 0x8df1d3 : ACCENT) : (hover ? 0x263440 : 0x192633);
+        paint.Round(x, y, w, h, compact ? 7.f : 9.f, fill, primary && enabled ? 0 : LINE);
         paint.Text(label, x + 10, y, w - 20, h, compact ? 11.f : 14.f,
-                   primary ? 0x092d26 : WHITE, true, DWRITE_TEXT_ALIGNMENT_CENTER);
-        hits.push_back({D2D1::RectF(x, y, x + w, y + h), action});
+                   !enabled ? 0x516275 : primary ? 0x092d26 : WHITE, enabled, DWRITE_TEXT_ALIGNMENT_CENTER);
+        if (enabled) hits.push_back({D2D1::RectF(x, y, x + w, y + h), action});
     }
     void DrawBrand() {
         paint.BrandIcon(19, 20, 45);
@@ -264,7 +272,8 @@ struct Ui {
         paint.Text(L"让每一次操作，都更跟手。", 25, height - 96, 170, 22, 11, MUTED);
         paint.Dot(29, height - 53, 3, ACCENT);
         paint.Text(L"局域网直连", 40, height - 67, 148, 28, 10, MUTED, true);
-        paint.Text(L"v0.2.1", 145, height - 36, 48, 15, 9, 0x516275);
+        static const std::wstring version = Wide("v" + remote_update::CurrentVersion());
+        paint.Text(version, 145, height - 36, 60, 15, 9, 0x516275);
     }
     void Field(float x, float y, float w, const wchar_t* label, const wchar_t* hint, bool password = false) {
         paint.Text(label, x, y, w, 20, 11, MUTED, true);
@@ -296,7 +305,7 @@ struct Ui {
         paint.Text(L"私人设备", right - 130, cardY + 40, 67, 25, 9, MUTED, true, DWRITE_TEXT_ALIGNMENT_CENTER);
         paint.Line(inner, cardY + 107, right - 28, cardY + 107, LINE);
         float formY = cardY + 130, fieldW = bodyW - 56;
-        Field(inner, formY, fieldW, L"主机地址", L"192.168.1.100:47990");
+        Field(inner, formY, fieldW, L"主机地址", L"127.0.0.1:47990");
         Field(inner, formY + 96, fieldW, L"配对令牌", L"", true);
         paint.Text(L"输入 Mac 端的配对令牌，成功配对后在本机加密保存。", inner, formY + 173, fieldW, 20, 11, MUTED);
         float bottom = cardY + cardH - 75;
@@ -332,6 +341,28 @@ struct Ui {
         paint.Text(title, x + 19, y + 48, w - 38, 25, 15, WHITE, true);
         paint.Text(desc, x + 19, y + 79, w - 38, 23, 10, MUTED);
     }
+    std::wstring UpdateStatus() const {
+        wchar_t buffer[512] {};
+        switch (update.stage) {
+        case remote_update::Stage::Checking: return L"正在检查 GitHub 正式版…";
+        case remote_update::Stage::UpToDate: return L"当前已是最新版本。";
+        case remote_update::Stage::Available:
+            std::swprintf(buffer, 512, remote_i18n::Text(L"发现新版本 %s，可下载安装。"), Wide(update.availableVersion).c_str());
+            return buffer;
+        case remote_update::Stage::Downloading:
+            if (update.totalBytes) {
+                const unsigned percent = static_cast<unsigned>(std::min<uint64_t>(100, update.downloadedBytes * 100 / update.totalBytes));
+                std::swprintf(buffer, 512, remote_i18n::Text(L"正在下载更新… %u%%"), percent);
+            } else {
+                std::swprintf(buffer, 512, remote_i18n::Text(L"正在下载更新… %.1f MiB"), update.downloadedBytes / 1048576.0);
+            }
+            return buffer;
+        case remote_update::Stage::Ready: return L"更新已下载并通过 SHA-256 校验，可以安装。";
+        case remote_update::Stage::Installing: return L"正在启动安装程序，应用将退出以完成更新。";
+        case remote_update::Stage::Error: return remote_i18n::Text(L"更新失败：") + Wide(update.error);
+        default: return L"手动检查正式版；下载后通过 SHA-256 校验再安装。";
+        }
+    }
     void DrawPreferences(float x, float w) {
         paint.Round(x, 159, w, 184, 13, PANEL, LINE);
         paint.Text(L"键盘快捷键", x + 28, 181, w - 56, 34, 19, WHITE, true);
@@ -350,6 +381,19 @@ struct Ui {
         HitButton(Action::LanguageChinese,x+205,614,164,40,L"简体中文",selected==remote_i18n::Language::SimplifiedChinese,true);
         HitButton(Action::LanguageEnglish,x+382,614,164,40,L"English",selected==remote_i18n::Language::English,true);
         paint.Text(L"切换后立即生效，不会中断连接。",x+28,666,w-56,23,11,MUTED);
+        paint.Round(x, 717, w, 150, 13, PANEL, LINE);
+        paint.Text(L"软件更新", x + 28, 732, w - 300, 30, 19, WHITE, true);
+        paint.Text(remote_i18n::Text(L"当前版本 ") + Wide(update.currentVersion), x + w - 260, 738, 232, 22, 10, MUTED,
+                   false, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        const bool updateBusy = update.stage == remote_update::Stage::Checking ||
+            update.stage == remote_update::Stage::Downloading || update.stage == remote_update::Stage::Installing;
+        HitButton(Action::CheckUpdate, x + 28, 786, 150, 40, L"检查更新", false, false, !updateBusy);
+        HitButton(Action::DownloadUpdate, x + 190, 786, 150, 40, L"下载更新", false, false,
+                  update.stage == remote_update::Stage::Available);
+        HitButton(Action::InstallUpdate, x + 352, 786, 150, 40, L"安装更新", true, false,
+                  update.stage == remote_update::Stage::Ready);
+        paint.Text(UpdateStatus(), x + 28, 836, w - 56, 23, 10,
+                   update.stage == remote_update::Stage::Error ? 0xf3a89a : MUTED);
     }
     void DrawConnected() {
         paint.target->Clear(D2D1::ColorF(BG));
@@ -533,7 +577,7 @@ struct Ui {
             if (!editProc) editProc = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(*controls[i], GWLP_WNDPROC));
             SetWindowLongPtrW(*controls[i], GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(EditWndProc));
         }
-        SetWindowTextW(address, Wide(options.address.empty() ? "192.168.1.100:47990" : options.address).c_str());
+        SetWindowTextW(address, Wide(options.address.empty() ? "127.0.0.1:47990" : options.address).c_str());
         SetWindowTextW(token, Wide(options.token).c_str());
         SendMessageW(token, EM_SETPASSWORDCHAR, 0x2022, 0);
         SendMessageW(token, EM_SETCUEBANNER, FALSE, reinterpret_cast<LPARAM>(remote_i18n::Text(L"输入配对令牌")));
@@ -881,6 +925,62 @@ struct Ui {
         if (fullscreen) ToggleFullscreen();
         Layout(); SetFocus(address);
     }
+    void ShowMainWindow() {
+        ReleaseInputs();
+        ShowWindow(window, IsIconic(window) ? SW_RESTORE : SW_SHOW);
+        SetForegroundWindow(window);
+        UpdateWindow(window);
+        PositionOverlays();
+    }
+    void ToggleMainWindow() {
+        if (IsWindowVisible(window) && !IsIconic(window)) {
+            ReleaseInputs();
+            ShowWindow(window, SW_HIDE);
+            PositionOverlays();
+        } else ShowMainWindow();
+    }
+    void SetTrayTooltip() {
+        if (!trayInstalled) return;
+        std::wcsncpy(tray.szTip, remote_i18n::Text(L"光梭 · GlideBeam"), 127);
+        tray.szTip[127] = L'\0';
+        Shell_NotifyIconW(NIM_MODIFY, &tray);
+    }
+    void AddTrayIcon() {
+        if (syntheticHarness) return;
+        tray = {};
+        tray.cbSize = sizeof tray;
+        tray.hWnd = window;
+        tray.uID = kTrayId;
+        tray.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_GUID;
+        tray.uCallbackMessage = kTrayMessage;
+        tray.hIcon = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(IDI_REMOTE_NATIVE), IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED));
+        tray.guidItem = {0x6f9d2f33, 0x5a7b, 0x4a61, {0x8c, 0x42, 0x67, 0x8e, 0x29, 0xb1, 0x10, 0x01}};
+        std::wcsncpy(tray.szTip, remote_i18n::Text(L"光梭 · GlideBeam"), 127);
+        tray.szTip[127] = L'\0';
+        trayInstalled = Shell_NotifyIconW(NIM_ADD, &tray) != 0;
+        if (!trayInstalled) remote_log::Write(remote_log::Level::Warning, "ui", "tray icon installation failed");
+    }
+    void RemoveTrayIcon() {
+        if (!trayInstalled) return;
+        Shell_NotifyIconW(NIM_DELETE, &tray);
+        trayInstalled = false;
+    }
+    void TrayMenu() {
+        HMENU menu = CreatePopupMenu();
+        if (!menu) return;
+        AppendMenuW(menu, MF_STRING, 1, remote_i18n::Text(IsWindowVisible(window) && !IsIconic(window) ? L"隐藏窗口" : L"打开窗口"));
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, 2, remote_i18n::Text(L"退出"));
+        POINT at {};
+        GetCursorPos(&at);
+        SetForegroundWindow(window);
+        const auto choice = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_BOTTOMALIGN, at.x, at.y, window, nullptr);
+        DestroyMenu(menu);
+        PostMessageW(window, WM_NULL, 0, 0);
+        if (choice == 1) ToggleMainWindow();
+        else if (choice == 2) PostMessageW(window, WM_CLOSE, 0, 0);
+    }
     void ToggleFullscreen() {
         if (!connected && !fullscreen) return;
         ReleaseInputs();
@@ -942,6 +1042,7 @@ struct Ui {
         remote_i18n::SetLanguage(language);
         if(persist&&!remote_windows_language::Save(language)) remote_log::Write(remote_log::Level::Warning,"ui","language preference save failed");
         SetWindowTextW(window,remote_i18n::Text(L"光梭 · GlideBeam"));
+        SetTrayTooltip();
         if(canvas)SetWindowTextW(canvas,remote_i18n::Text(L"Mac 桌面"));
         if(token)SendMessageW(token,EM_SETCUEBANNER,FALSE,reinterpret_cast<LPARAM>(remote_i18n::Text(L"输入配对令牌")));
         exchange.RefreshLanguage();
@@ -971,6 +1072,9 @@ struct Ui {
         case Action::Disconnect: Disconnect(); break;
         case Action::Sessions: showSettings = false; Layout(); break;
         case Action::Settings: showSettings = true; Layout(); break;
+        case Action::CheckUpdate: updater.Check(); break;
+        case Action::DownloadUpdate: updater.Download(); break;
+        case Action::InstallUpdate: if (updater.Install(window)) PostMessageW(window, WM_CLOSE, 0, 0); break;
         }
         if (toolbar.window) InvalidateRect(toolbar.window, nullptr, FALSE);
     }
@@ -1000,6 +1104,12 @@ struct Ui {
         exchange.Tick();
         remote_ui_watchdog::Beat("session-poll");
         session->Tick();
+        auto nextUpdate = updater.GetSnapshot();
+        if (nextUpdate.revision != update.revision) {
+            update = std::move(nextUpdate);
+            hovered = -1;
+            if (showSettings) InvalidateRect(window, nullptr, FALSE);
+        }
         auto next = session->Snapshot();
         if (localError && next.state == SessionState::Idle) return;
         bool nextConnected = next.state == SessionState::Connected;
@@ -1054,6 +1164,13 @@ struct Ui {
             if (metrics.window && IsWindowVisible(metrics.window)) InvalidateRect(metrics.window, nullptr, FALSE);
         remote_ui_watchdog::Beat();
         }
+    }
+    int HitAt(float x, float y) const {
+        for (size_t i = 0; i < hits.size(); ++i) {
+            const auto rect = hits[i].rect;
+            if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) return static_cast<int>(i);
+        }
+        return -1;
     }
     static LRESULT CALLBACK EditWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         auto ui = reinterpret_cast<Ui*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -1163,6 +1280,7 @@ struct Ui {
         // and taskbar minimize requests must not alter that synthetic state.
         if(ui->syntheticHarness && (message==WM_ACTIVATEAPP ||
             (message==WM_SYSCOMMAND && (wParam&0xfff0)==SC_MINIMIZE)))return 0;
+        if (ui->taskbarCreatedMessage && message == ui->taskbarCreatedMessage) { ui->AddTrayIcon(); return 0; }
         switch (message) {
         case WM_CREATE:
             ui->scale = GetDpiForWindow(hwnd) / 96.f;
@@ -1174,9 +1292,21 @@ struct Ui {
             if (!ui->CreateOverlays()) { ui->DestroyOverlays(); return -1; }
             ui->CreateEdits(); ui->Layout(); SetTimer(hwnd, kPollTimer, 16, nullptr);
             ui->exchange.Attach(hwnd,ui->canvas,ui->session);
+            ui->taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
+            ui->AddTrayIcon();
             if (ui->autoConnect) PostMessageW(hwnd, kConnectMessage, 0, 0);
             return 0;
         case kConnectMessage: ui->Connect(); return 0;
+        case kGlideBeamShowMessage:
+            ui->ShowMainWindow();
+            if (wParam && ui->snapshot.state != SessionState::Connected && ui->snapshot.state != SessionState::Connecting) PostMessageW(hwnd, kConnectMessage, 0, 0);
+            return 0;
+        case kTrayMessage:
+            if (wParam == static_cast<WPARAM>(kTrayId)) {
+                if (lParam == WM_LBUTTONUP || lParam == WM_LBUTTONDBLCLK) ui->ToggleMainWindow();
+                else if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU) ui->TrayMenu();
+            }
+            return 0;
         case WM_CLIPBOARDUPDATE: ui->exchange.ClipboardChanged(); return 0;
         case WM_SIZE: if (ui->address) ui->Layout(); return 0;
         case WM_MOVE: if (ui->address) ui->PositionOverlays(); return 0;
@@ -1196,7 +1326,7 @@ struct Ui {
         case WM_GETMINMAXINFO: {
             auto info = reinterpret_cast<MINMAXINFO*>(lParam); float scale = GetDpiForWindow(hwnd) / 96.f;
             info->ptMinTrackSize.x = static_cast<LONG>((ui->connected ? 820 : 1060) * scale);
-            info->ptMinTrackSize.y = static_cast<LONG>((ui->connected ? 420 : 810) * scale); return 0;
+            info->ptMinTrackSize.y = static_cast<LONG>((ui->connected ? 420 : 920) * scale); return 0;
         }
         case WM_PAINT: { PAINTSTRUCT ps; BeginPaint(hwnd, &ps); ui->RenderWindow(); EndPaint(hwnd, &ps); return 0; }
         case WM_ERASEBKGND: return 1;
@@ -1206,16 +1336,18 @@ struct Ui {
         case WM_MOUSEMOVE: {
             if (ui->connected) { ui->CanvasActivity(lParam); return 0; }
             float x = GET_X_LPARAM(lParam) / ui->scale, y = GET_Y_LPARAM(lParam) / ui->scale;
-            int hover = -1;
-            for (size_t i = 0; i < ui->hits.size(); ++i) { auto r = ui->hits[i].rect; if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) { hover = static_cast<int>(i); break; } }
+            int hover = ui->HitAt(x, y);
             if (hover != ui->hovered) { ui->hovered = hover; InvalidateRect(hwnd, nullptr, FALSE); }
             TRACKMOUSEEVENT tracking {sizeof tracking, TME_LEAVE, hwnd, 0}; TrackMouseEvent(&tracking); return 0;
         }
         case WM_MOUSELEAVE: ui->hovered = -1; InvalidateRect(hwnd, nullptr, FALSE); return 0;
         case WM_SETCURSOR: if (LOWORD(lParam) == HTCLIENT) { SetCursor(LoadCursorW(nullptr, ui->hovered >= 0 ? IDC_HAND : IDC_ARROW)); return TRUE; } break;
-        case WM_LBUTTONUP:
-            if (ui->hovered >= 0 && ui->hovered < static_cast<int>(ui->hits.size())) ui->Activate(ui->hits[ui->hovered].action);
+        case WM_LBUTTONUP: {
+            const int hit = ui->HitAt(GET_X_LPARAM(lParam) / ui->scale, GET_Y_LPARAM(lParam) / ui->scale);
+            ui->hovered = hit;
+            if (hit >= 0) ui->Activate(ui->hits[hit].action);
             return 0;
+        }
         case WM_TIMER: if (wParam == kPollTimer) ui->Poll(); return 0;
         case WM_ACTIVATEAPP:
             ui->appActive = wParam != 0;
@@ -1228,7 +1360,7 @@ struct Ui {
             remote_log::Write(remote_log::Level::Info, "ui", "main_close_begin");
             remote_ui_watchdog::Beat("main-close");
             ui->ReleaseInputs(); ui->session->Disconnect(); DestroyWindow(hwnd); return 0;
-        case WM_DESTROY: KillTimer(hwnd, kPollTimer); ui->exchange.Close(); ui->DestroyOverlays(); PostQuitMessage(0); return 0;
+        case WM_DESTROY: KillTimer(hwnd, kPollTimer); ui->RemoveTrayIcon(); ui->exchange.Close(); ui->DestroyOverlays(); PostQuitMessage(0); return 0;
         }
         return DefWindowProcW(hwnd, message, wParam, lParam);
     }
@@ -1260,7 +1392,7 @@ int CreateUi(HINSTANCE instance, int showCommand, IClientSession& session,
     Ui ui; ui.instance = instance; ui.session = &session; ui.options = initialOptions; ui.autoConnect = autoConnect;
     if (!ui.paint.Init()) return 1;
     RegisterUiClasses(instance);
-    UINT dpi = GetDpiForSystem(); RECT size {0, 0, MulDiv(1280, dpi, 96), MulDiv(820, dpi, 96)};
+    UINT dpi = GetDpiForSystem(); RECT size {0, 0, MulDiv(1280, dpi, 96), MulDiv(940, dpi, 96)};
     AdjustWindowRectExForDpi(&size, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, FALSE, 0, dpi);
     HWND window = CreateWindowExW(0, kWindowClass, remote_i18n::Text(L"光梭 · GlideBeam"), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, size.right - size.left, size.bottom - size.top, nullptr, nullptr, instance, &ui);
@@ -1287,12 +1419,12 @@ int CreateUi(HINSTANCE instance, int showCommand, IClientSession& session,
 
 bool RenderUiPreview(const wchar_t* path, UiPreview mode) {
     ComApartment apartment;
-    Ui ui; ui.preview = true; ui.width = 1280; ui.height = 820;
+    Ui ui; ui.preview = true; ui.width = 1280; ui.height = mode == UiPreview::Preferences ? 940 : 820;
     ui.connected = mode != UiPreview::Landing && mode != UiPreview::Preferences;
     ui.showSettings = mode == UiPreview::Preferences;
     ui.fullscreen = mode == UiPreview::Fullscreen || mode == UiPreview::FullscreenHidden;
     ui.previewOverlays = mode != UiPreview::ConnectedHidden && mode != UiPreview::FullscreenHidden;
-    ui.metricsVisible = ui.previewOverlays; ui.options.address = "192.168.1.100:47990";
+    ui.metricsVisible = ui.previewOverlays; ui.options.address = "127.0.0.1:47990";
     if (ui.fullscreen) { ui.width = 1920; ui.height = 1080; }
     ui.snapshot.state = SessionState::Connected; ui.snapshot.fps = 29.8;
     ui.snapshot.bitrateMbps = 8.62; ui.snapshot.networkMs = 1.24; ui.snapshot.decodeMs = 1.70;
@@ -1662,6 +1794,38 @@ bool RunUiSelfTest(HINSTANCE instance, const wchar_t* reportPath) {
         SendMessageW(ui.canvas, WM_KEYDOWN, VK_F11, 1); pump();
         GetWindowPlacement(window, &restored);
         check("maximized_window_placement_restores", !ui.fullscreen && IsZoomed(window) && restored.showCmd == maximized.showCmd && EqualRect(&maximized.rcNormalPosition, &restored.rcNormalPosition));
+
+        auto hasMainAction = [&](Action action) {
+            return std::any_of(ui.hits.begin(), ui.hits.end(), [action](const Hit& hit) { return hit.action == action; });
+        };
+        ui.connected = false; ui.showSettings = true; ui.snapshot.state = SessionState::Idle; ui.Layout();
+        InvalidateRect(window, nullptr, FALSE); UpdateWindow(window);
+        check("preferences_exposes_current_version_and_check_update", !ui.update.currentVersion.empty() &&
+            hasMainAction(Action::CheckUpdate) && !hasMainAction(Action::DownloadUpdate) && !hasMainAction(Action::InstallUpdate));
+        ui.update.stage = remote_update::Stage::Available; InvalidateRect(window, nullptr, FALSE); UpdateWindow(window);
+        check("preferences_enables_download_only_when_update_available", hasMainAction(Action::DownloadUpdate) && !hasMainAction(Action::InstallUpdate));
+        int staleHover = -1;
+        LPARAM stalePoint = 0;
+        for (size_t i = 0; i < ui.hits.size(); ++i) {
+            if (ui.hits[i].action != Action::DownloadUpdate) continue;
+            staleHover = static_cast<int>(i);
+            stalePoint = MAKELPARAM(static_cast<int>((ui.hits[i].rect.left + ui.hits[i].rect.right) * ui.scale / 2),
+                static_cast<int>((ui.hits[i].rect.top + ui.hits[i].rect.bottom) * ui.scale / 2));
+        }
+        ui.hovered = staleHover;
+        ui.update.stage = remote_update::Stage::Ready; InvalidateRect(window, nullptr, FALSE); UpdateWindow(window);
+        check("preferences_enables_install_only_after_verified_download", hasMainAction(Action::InstallUpdate));
+        SendMessageW(window, WM_LBUTTONUP, 0, stalePoint);
+        check("stale_hover_cannot_activate_changed_update_action", ui.hovered == -1 && ui.update.stage == remote_update::Stage::Ready);
+        ui.showSettings = false; ui.connected = true; ui.snapshot = session.Snapshot(); ui.Layout();
+
+        ShowWindow(window, SW_HIDE);
+        SendMessageW(window, kGlideBeamShowMessage, 0, 0);
+        check("second_instance_message_reuses_same_window_without_disconnect", IsWindowVisible(window) && session.disconnects == 0);
+        SendMessageW(window, kTrayMessage, kTrayId, WM_LBUTTONUP);
+        check("tray_left_click_hides_without_disconnect", !IsWindowVisible(window) && session.disconnects == 0);
+        SendMessageW(window, kTrayMessage, kTrayId, WM_LBUTTONUP);
+        check("tray_left_click_restores_same_window", IsWindowVisible(window) && session.disconnects == 0);
 
         HWND toolbar = ui.toolbar.window, metrics = ui.metrics.window, notice = ui.captureNotice.window;
         SendMessageW(window, WM_CLOSE, 0, 0); pump();

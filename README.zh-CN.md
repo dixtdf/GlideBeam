@@ -11,6 +11,7 @@
 ## 已有功能
 
 - Windows 11 原生客户端和 macOS 主机端；真正全屏、顶部自动隐藏工具栏、可拖动且限制在窗口内的状态浮窗。
+- Windows 右下角托盘左键切换窗口显隐；固定 AppUserModelID 并通过单实例复用同一窗口，便于固定到任务栏。偏好设置可检查、下载并安装正式版更新，Setup 会自动关闭正在运行的客户端。
 - Mac 使用 ScreenCaptureKit 采集、VideoToolbox H.264 编码；优先硬件，不可用时软件回退并限制到 30 FPS。Windows 使用 Media Foundation / D3D11 硬件解码和 GPU 呈现。
 - Mac 系统声音传到 Windows（0.3.0，需更新双端）：5 ms PCM 音频包、独立 WASAPI 播放线程、自适应缓冲与时钟漂移补偿；支持静音及输出设备恢复。传输信息显示音频缓冲、声卡周期、欠载和丢包，详见[音频说明](docs/audio.md)。
 - 地址加一个可自定义、持久保存的配对令牌。同一 IP 连续 10 次完整错误令牌验证后封禁，Mac 界面可解除封禁。
@@ -19,18 +20,18 @@
 
 当前覆盖已登录的单屏 Mac 桌面与局域网。尚未实现麦克风转发、富文本、目录镜像、登录前控制或公网中继。视频使用 H.264，不承诺 HEVC 支持。
 
-[v1.0.0](https://github.com/dixtdf/GlideBeam/releases/tag/v1.0.0) 新增 Windows Setup 安装程序，继续提供便携 ZIP，保留 0.3.0 的系统音频和诊断功能；从 0.2.1 更新时请同时更新双端。安装方式与验证范围见 [1.0.0 发布说明](https://github.com/dixtdf/GlideBeam/blob/v1.0.0/docs/releases/1.0.0.md)。
+[v1.1.0](https://github.com/dixtdf/GlideBeam/releases/tag/v1.1.0) 新增 Windows 托盘显隐、任务栏固定所需的稳定 AppUserModelID 与单实例复用窗口，以及带 SHA-256 校验的软件内检查、下载和安装更新。默认地址改为 `127.0.0.1:47990`，Setup 可自动关闭正在运行的客户端。安装与更新说明见 [1.1.0 发布说明](https://github.com/dixtdf/GlideBeam/blob/v1.1.0/docs/releases/1.1.0.md)。
 
 ## 开始使用
 
-1. 按两台电脑的架构下载发行包。Windows 的 Intel/AMD 电脑运行 `GlideBeam-1.0.0-Windows-x64-Setup.exe`，ARM 电脑选择 ARM64 Setup，也可继续使用便携 ZIP；Mac ZIP 包含 `GlideBeam Host.app`。
+1. 按两台电脑的架构下载发行包。Windows 的 Intel/AMD 电脑运行 `GlideBeam-1.1.0-Windows-x64-Setup.exe`，ARM 电脑选择 ARM64 Setup，也可继续使用便携 ZIP；Mac ZIP 包含 `GlideBeam Host.app`。
 2. 打开 Mac 端，在系统设置允许「屏幕录制」和「辅助功能」。必要时使用「设置屏幕与输入权限」「重试画面采集」。需要可用的 Mac 桌面和显示器采集源。
-3. 复制 Mac 窗口显示的地址与完整配对令牌，在 Windows 客户端填写并连接。默认端口为 **UDP 47990**，需要局域网放行。VNC 密码不能代替光梭的配对令牌。
+3. 复制 Mac 窗口显示的地址与完整配对令牌，在 Windows 客户端填写并连接。默认地址为 **127.0.0.1:47990**，远程连接时请改成 Mac 的局域网地址；默认端口为 **UDP 47990**，需要局域网放行。VNC 密码不能代替光梭的配对令牌。
 4. 将鼠标移到远控窗口顶部中央即可显示工具栏，打开文件传输、统计、日志或重启控制。关闭 Mac 连接窗口后，主机端仍在菜单栏运行。
 
 两端可分别选择「跟随系统」「English」「简体中文」。Windows 入口为「偏好设置 → 界面语言」，连接后也可在「更多 → 语言」切换；Mac 窗口顶部和菜单均提供入口。「登录后自动启动」在该用户进入 macOS 桌面后运行，不提供登录前控制。
 
-Windows Setup 支持简体中文和 English，仅为当前用户安装到 `%LOCALAPPDATA%\Programs\GlideBeam`，无需管理员权限。安装时创建开始菜单快捷方式，桌面快捷方式可选。运行新版 Setup 即可升级，在 Windows「已安装的应用」中卸载；升级和卸载均保留 `%LOCALAPPDATA%\RemoteNative` 中的设置及配对资料。Windows 程序和安装包尚未签名。便携版请完整解压到同一目录，运行 `GlideBeam.exe` 或 `Start-GlideBeam.cmd`。
+Windows Setup 支持简体中文和 English，仅为当前用户安装到 `%LOCALAPPDATA%\Programs\GlideBeam`，无需管理员权限。安装时创建开始菜单快捷方式，桌面快捷方式可选。运行新版 Setup 即可升级，在 Windows「已安装的应用」中卸载；升级和卸载均保留 `%LOCALAPPDATA%\RemoteNative` 中的设置及配对资料。「偏好设置 → 软件更新」可手动检查 GitHub 最新正式版，按当前架构下载 Setup 并核对同 Release `SHA256SUMS.txt` 后再启动安装；更新包保存在 `%LOCALAPPDATA%\GlideBeam\updates`。安装时当前客户端会有序断开并退出，Setup 也会自动关闭占用目标文件的进程，更新后需重新打开应用。Windows 程序和安装包尚未签名，HTTPS 与同 Release 校验和不等同于发布者签名验证。便携版请完整解压到同一目录，运行 `GlideBeam.exe` 或 `Start-GlideBeam.cmd`。
 
 断开连接只释放远端键鼠状态，**不会主动锁定 Mac**。macOS 自身的屏保、睡眠和密码设置仍然生效。
 

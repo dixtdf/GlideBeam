@@ -11,6 +11,7 @@ GlideBeam combines a local Windows cursor, independent input transport, Mac H.26
 ## Features
 
 - Native Windows 11 client and macOS host; a full-screen desktop with an automatically hidden top toolbar and movable, window-bounded diagnostics overlay.
+- A notification-area icon whose left click toggles the window. A stable AppUserModelID and single-instance activation reuse the same window for taskbar pinning. Preferences can check, download and install stable updates; Setup closes the running client before replacing it.
 - ScreenCaptureKit capture and VideoToolbox H.264 encoding on Mac, with hardware preference and a software fallback capped at 30 FPS; Media Foundation/D3D11 hardware decoding and GPU presentation on Windows.
 - Mac system audio on Windows (0.3.0; requires updated endpoints): 5 ms PCM packets, an independent WASAPI worker, adaptive buffering and clock-drift correction, with mute and output-device recovery. The diagnostics overlay reports audio queues, engine period, underruns and loss; see [audio](docs/audio.md).
 - Pair using an address and one customizable, persistent token. Ten consecutive invalid token proofs block the source IP; the Mac UI can unblock it.
@@ -19,18 +20,18 @@ GlideBeam combines a local Windows cursor, independent input transport, Mac H.26
 
 The initial scope is an already logged-in, single-display Mac desktop on a LAN. Microphone forwarding, rich text, directory mirroring, unattended login-screen control, and an Internet relay are not implemented. H.264 is the current video codec; HEVC is not promised.
 
-[v1.0.0](https://github.com/dixtdf/GlideBeam/releases/tag/v1.0.0) adds Windows Setup installers alongside the portable ZIPs. It retains the system audio and diagnostics introduced in 0.3.0; update both endpoints if coming from 0.2.1. See the [1.0.0 release notes](https://github.com/dixtdf/GlideBeam/blob/v1.0.0/docs/releases/1.0.0.md) for installation details and validation scope.
+[v1.1.0](https://github.com/dixtdf/GlideBeam/releases/tag/v1.1.0) adds a Windows notification-area toggle, a stable AppUserModelID with single-instance window reuse for taskbar pinning, and in-app update check/download/install with SHA-256 verification. The default address is now `127.0.0.1:47990`, and Setup can close a running client automatically. See the [1.1.0 release notes](https://github.com/dixtdf/GlideBeam/blob/v1.1.0/docs/releases/1.1.0.md) for update behavior and validation scope.
 
 ## Get started
 
-1. Download the package for each computer's architecture. On Windows, run `GlideBeam-1.0.0-Windows-x64-Setup.exe` (Intel/AMD) or the ARM64 Setup on an ARM PC; a portable ZIP is also available. Mac ZIPs contain `GlideBeam Host.app`.
+1. Download the package for each computer's architecture. On Windows, run `GlideBeam-1.1.0-Windows-x64-Setup.exe` (Intel/AMD) or the ARM64 Setup on an ARM PC; a portable ZIP is also available. Mac ZIPs contain `GlideBeam Host.app`.
 2. Open the Mac host. Grant **Screen Recording** and **Accessibility** in System Settings, and use **Screen and input permissions** / **Retry capture** if needed. A working Mac desktop and display source are required.
-3. Copy the address and full pairing token shown by the Mac host. Enter both in the Windows client and connect. The default port is **UDP 47990**; allow it on your LAN. An existing VNC password is unrelated to GlideBeam pairing.
+3. Copy the address and full pairing token shown by the Mac host. Enter both in the Windows client and connect. The default address is **127.0.0.1:47990**; replace it with the Mac's LAN address for a remote session. The default port is **UDP 47990**; allow it on your LAN. An existing VNC password is unrelated to GlideBeam pairing.
 4. Move the pointer to the top center of the remote window to reveal the toolbar. File transfer, statistics, logs, and restart controls are available there. The Mac host can continue in the menu bar when its window closes.
 
 Choose **Follow system**, **English**, or **简体中文** separately on each computer. Windows provides **Preferences → Interface language**, plus **More → Language** while connected. Mac provides a language selector at the top of the host window and in its menu. Enable **Start at login** on Mac to run after that user logs in; it does not provide control before login.
 
-Windows Setup installs for the current user into `%LOCALAPPDATA%\Programs\GlideBeam`, without administrator privileges. It offers English/Simplified Chinese, a Start menu shortcut and an optional desktop shortcut. Run a newer Setup to upgrade, or use Windows **Installed apps** to uninstall. Both retain settings and pairing data in `%LOCALAPPDATA%\RemoteNative`. The Windows app and installer are unsigned. Portable ZIP users should extract the whole package into one folder and run `GlideBeam.exe` or `Start-GlideBeam.cmd`.
+Windows Setup installs for the current user into `%LOCALAPPDATA%\Programs\GlideBeam`, without administrator privileges. It offers English/Simplified Chinese, a Start menu shortcut and an optional desktop shortcut. Run a newer Setup to upgrade, or use Windows **Installed apps** to uninstall. Both retain settings and pairing data in `%LOCALAPPDATA%\RemoteNative`. **Preferences → Software updates** checks the latest stable GitHub release on demand, selects the current architecture's Setup, and verifies it against the same release's `SHA256SUMS.txt` before installation. Downloads stay in `%LOCALAPPDATA%\GlideBeam\updates`. The client disconnects and exits for the update, Setup also closes processes holding the target files, and the application is not automatically restarted. The Windows app and installer are unsigned; HTTPS and a same-release checksum do not replace publisher signature verification. Portable ZIP users should extract the whole package into one folder and run `GlideBeam.exe` or `Start-GlideBeam.cmd`.
 
 Disconnecting GlideBeam releases remote keyboard/mouse state and does **not** actively lock the Mac. macOS screen saver, sleep, and password settings remain in effect.
 

@@ -9,9 +9,11 @@
 #include "session.h"
 #include "smoke.h"
 #include "decode-smoke.h"
+#include "updater.h"
 #include "exchange-windows.h"
 #include "../../shared/diagnostic-log.h"
 #include <shellapi.h>
+#include <shobjidl.h>
 #include <memory>
 #include <string>
 
@@ -25,6 +27,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         }
     } diagnosticsExit;
     remote_log::Write(remote_log::Level::Info,"windows-app","startup");
+    if (FAILED(SetCurrentProcessExplicitAppUserModelID(kGlideBeamAppUserModelId)))
+        remote_log::Write(remote_log::Level::Warning,"windows-app","explicit AppUserModelID could not be set");
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     int argc = 0;
     auto argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -85,6 +89,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
             LocalFree(argv);
             return RunSessionSelfTest() ? 0 : 3;
         }
+        if (std::wstring(argv[i]) == L"--selftest-updater") {
+            if (i + 1 >= argc) { LocalFree(argv); return 5; }
+            const bool passed = remote_update::RunUpdaterSelfTest(argv[i + 1]);
+            LocalFree(argv);
+            return passed ? 0 : 3;
+        }
         if (std::wstring(argv[i]) == L"--import-pairing" && i + 1 < argc) {
             bool imported = ImportPairingFile(argv[++i]);
             LocalFree(argv);
@@ -93,6 +103,35 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         if (std::wstring(argv[i]) == L"--connect") autoConnect = true;
     }
     LocalFree(argv);
+    struct InstanceGuard {
+        HANDLE handle = nullptr;
+        ~InstanceGuard() { if (handle) CloseHandle(handle); }
+    } instanceGuard;
+    instanceGuard.handle = CreateMutexW(nullptr, TRUE, L"Local\\dixtdf.GlideBeam.SingleInstance");
+    const DWORD instanceStatus = GetLastError();
+    if (!instanceGuard.handle) {
+        remote_log::Write(remote_log::Level::Error,"windows-app","single-instance mutex creation failed");
+        MessageBoxW(nullptr, remote_i18n::Text(L"光梭单实例初始化失败。"), remote_i18n::Text(L"光梭 · GlideBeam"), MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    if (instanceStatus == ERROR_ALREADY_EXISTS) {
+        bool startReplacement = false;
+        for (unsigned attempt = 0; attempt < 50; ++attempt) {
+            HWND existing = FindWindowW(kGlideBeamWindowClass, nullptr);
+            if (existing && PostMessageW(existing, kGlideBeamShowMessage, autoConnect ? 1 : 0, 0)) return 0;
+            const DWORD wait = WaitForSingleObject(instanceGuard.handle, 0);
+            if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) { startReplacement = true; break; }
+            if (wait == WAIT_FAILED) {
+                remote_log::Write(remote_log::Level::Error,"windows-app","single-instance ownership check failed");
+                return 1;
+            }
+            Sleep(100);
+        }
+        if (!startReplacement) {
+            remote_log::Write(remote_log::Level::Warning,"windows-app","existing process has no main window; activation request not delivered");
+            return 0;
+        }
+    }
     auto session = CreateClientSession();
     if (!session) {
         remote_log::Write(remote_log::Level::Error,"windows-app","session service initialization failed");

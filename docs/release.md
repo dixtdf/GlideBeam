@@ -25,8 +25,9 @@ Setup is built from the verified matching Windows ZIP. Its payload has the same 
 
 1. Update `VERSION` and the application metadata as needed, then commit the intended release source.
 2. Run the branch workflow and review its results and architecture artifacts.
-3. Create and push a tag exactly matching `v` plus `VERSION`, for example `v1.0.0`.
+3. Create and push a tag exactly matching `v` plus `VERSION`, for example `v1.1.0`.
 4. After every architecture job succeeds, the workflow verifies the four ZIPs and two Setup EXEs and creates a **draft GitHub Release** with those six binaries and a combined `SHA256SUMS.txt` (seven assets total). Sidecar checksums remain in Actions artifacts; the release uses the combined manifest.
+   The Windows in-app updater reads only the latest published stable release, selects the exact architecture-specific Setup, and verifies it against this combined `SHA256SUMS.txt` before starting Setup. Keep the Setup assets and manifest in the same release; the updater does not consume Actions-only sidecars. The running client exits for installation and is not automatically restarted.
 5. Review the release notes and download the artifacts. Verify all six files against `SHA256SUMS.txt`, inspect archive contents and embedded versions/architectures, and check the x64 Setup lifecycle results before publishing the draft. Keep physical ARM64 and paired-session limits explicit.
 
 A prerelease version marks the draft as a prerelease. A rerun may update an existing draft; it refuses to overwrite an already published release. Only the tag release job receives repository content-write permission; builds use read permission.
